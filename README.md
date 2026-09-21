@@ -47,7 +47,8 @@ Figma ┘   (IDs kept)                      └─> tokens.manifest.json  (Figma
 ## Install
 
 - **Figma plugin**: download `token-foundry-figma-plugin-<version>.zip` from [Releases](https://github.com/EstherHasi/token-foundry/releases), unzip, then in Figma desktop, right-mouse click on the canvas: Plugins → Development → Import plugin from manifest → select the `manifest.json` file.
-- **Cowork**: download `token-foundry-<version>.plugin` from [Releases](https://github.com/EstherHasi/token-foundry/releases), open it and install it.
+- **Cowork**: Option 1: download `token-foundry-<version>.plugin` from [Releases](https://github.com/EstherHasi/token-foundry/releases). Open Claude, go to Customize and Load plugin. Option 2: Open Claude, go to Customize, Add plugin from marketplace: EstherHasi/token-foundry
+With the second option, you get automatic updates :)
 - **Claude Code**:
 
 ```

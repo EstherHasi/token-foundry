@@ -1,0 +1,1388 @@
+// token-foundry engine (JavaScript port of tokenkit.py). Runs in the Figma plugin UI and in Node.
+// Pure functions, no DOM, no network. Kept in parity with skills/token-audit/scripts/tokenkit.py
+// (tests/parity.js compares both on the fixtures).
+//
+//   TK.ingestFigma(exportJson)            -> model
+//   TK.ingestCss(cssText, manifest?)      -> model
+//   TK.audit(model, pairs?)               -> audit { summary, findings, ai, contrast, suggestions }
+//   TK.generate(model, opts)              -> { manifest, css, log }
+//   TK.renderAuditMd(audit) / TK.renderReport(before, after, log) -> markdown strings
+
+var TK = (function () {
+  "use strict";
+  var VERSION = "0.2.0";
+
+  // ---------------------------------------------------------------- utils
+  function pyRound(x, nd) {
+    var m = Math.pow(10, nd || 0);
+    var y = x * m;
+    var f = Math.floor(y);
+    var r = Math.abs(y - f - 0.5) < 1e-9 ? (f % 2 === 0 ? f : f + 1) : Math.round(y);
+    return r / m;
+  }
+  function has(o, k) { return Object.prototype.hasOwnProperty.call(o, k); }
+  function isDigits(s) { return /^\d+$/.test(s); }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function uniqSorted(a) {
+    var s = Array.from(new Set(a || []));
+    s.sort(function (x, y) { return x < y ? -1 : x > y ? 1 : 0; });
+    return s;
+  }
+  function cmp(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
+  function mostCommon(map) { // Map key->count, first inserted wins ties
+    var best = null, bc = -1;
+    map.forEach(function (c, k) { if (c > bc) { best = k; bc = c; } });
+    return best;
+  }
+  function inc(map, k) { map.set(k, (map.get(k) || 0) + 1); }
+  function pushMap(map, k, v) { if (!map.has(k)) map.set(k, []); map.get(k).push(v); }
+  function intersects(set, arr) { for (var i = 0; i < arr.length; i++) if (set.has(arr[i])) return true; return false; }
+  function pyList(a) { return "[" + a.join(", ") + "]"; }
+  function lastSeg(name) { var p = name.split("/"); return p[p.length - 1].trim(); }
+  function parentOf(name) { var i = name.lastIndexOf("/"); return i < 0 ? name : name.slice(0, i); }
+  function firstVal(t) { var k = Object.keys(t.values); return k.length ? t.values[k[0]] : {}; }
+  function fmtNum(n) { return String(n); }
+
+  // ---------------------------------------------------------------- colorsys
+  function rgbToHls(r, g, b) {
+    var maxc = Math.max(r, g, b), minc = Math.min(r, g, b), sumc = maxc + minc, rangec = maxc - minc;
+    var l = sumc / 2, h, s;
+    if (minc === maxc) return [0, l, 0];
+    s = l <= 0.5 ? rangec / sumc : rangec / (2 - maxc - minc);
+    var rc = (maxc - r) / rangec, gc = (maxc - g) / rangec, bc = (maxc - b) / rangec;
+    if (r === maxc) h = bc - gc;
+    else if (g === maxc) h = 2 + rc - bc;
+    else h = 4 + gc - rc;
+    h = ((h / 6) % 1 + 1) % 1;
+    return [h, l, s];
+  }
+  function _v(m1, m2, hue) {
+    hue = ((hue % 1) + 1) % 1;
+    if (hue < 1 / 6) return m1 + (m2 - m1) * hue * 6;
+    if (hue < 0.5) return m2;
+    if (hue < 2 / 3) return m1 + (m2 - m1) * (2 / 3 - hue) * 6;
+    return m1;
+  }
+  function hlsToRgb(h, l, s) {
+    if (s === 0) return [l, l, l];
+    var m2 = l <= 0.5 ? l * (1 + s) : l + s - l * s;
+    var m1 = 2 * l - m2;
+    return [_v(m1, m2, h + 1 / 3), _v(m1, m2, h), _v(m1, m2, h - 1 / 3)];
+  }
+
+  // ---------------------------------------------------------------- color
+  var NAMED = { black: "#000000", white: "#ffffff", transparent: "#00000000" };
+  function clamp(x) { return Math.max(0, Math.min(1, x)); }
+  function parseColor(s) {
+    if (s && typeof s === "object" && has(s, "r") && has(s, "g") && has(s, "b")) {
+      return [Number(s.r), Number(s.g), Number(s.b), has(s, "a") ? Number(s.a) : 1];
+    }
+    if (typeof s !== "string") return null;
+    var t = s.trim().toLowerCase();
+    if (has(NAMED, t)) t = NAMED[t];
+    var m = /^#([0-9a-f]{3,8})$/.exec(t);
+    if (m) {
+      var h = m[1];
+      if (h.length === 3 || h.length === 4) h = h.split("").map(function (c) { return c + c; }).join("");
+      if (h.length !== 6 && h.length !== 8) return null;
+      var n = function (i) { return parseInt(h.slice(i, i + 2), 16) / 255; };
+      return [n(0), n(2), n(4), h.length === 8 ? n(6) : 1];
+    }
+    m = /^(rgba?|hsla?)\((.*)\)$/.exec(t);
+    if (!m) return null;
+    var parts = m[2].trim().split(/[\s,\/]+/).filter(Boolean);
+    if (parts.length < 3) return null;
+    var num = function (p, scale) {
+      if (p.endsWith("%")) return parseFloat(p.slice(0, -1)) / 100;
+      var v = Number(p);
+      if (isNaN(v)) throw new Error("nan");
+      return v / scale;
+    };
+    var r, g, b, a;
+    try {
+      a = parts.length > 3 ? num(parts[3], 1) : 1;
+      if (m[1].indexOf("rgb") === 0) { r = num(parts[0], 255); g = num(parts[1], 255); b = num(parts[2], 255); }
+      else {
+        var hdeg = Number(parts[0].replace("deg", ""));
+        if (isNaN(hdeg)) throw new Error("nan");
+        var rgb = hlsToRgb((((hdeg % 360) + 360) % 360) / 360, num(parts[2], 100), num(parts[1], 100));
+        r = rgb[0]; g = rgb[1]; b = rgb[2];
+      }
+    } catch (e) { return null; }
+    return [clamp(r), clamp(g), clamp(b), clamp(a)];
+  }
+  function hex2(x) { var s = pyRound(clamp(x) * 255).toString(16); return s.length < 2 ? "0" + s : s; }
+  function toHex(c) {
+    var h = "#" + hex2(c[0]) + hex2(c[1]) + hex2(c[2]);
+    if (pyRound(c[3] * 255) < 255) h += hex2(c[3]);
+    return h;
+  }
+  function lin(u) { return u <= 0.04045 ? u / 12.92 : Math.pow((u + 0.055) / 1.055, 2.4); }
+  function luminance(c) { return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]); }
+  function composite(fg, bg) { var a = fg[3]; return [0, 1, 2].map(function (i) { return fg[i] * a + bg[i] * (1 - a); }).concat([1]); }
+  function contrast(fg, bg, backdrop) {
+    backdrop = backdrop || [1, 1, 1, 1];
+    if (bg[3] < 1) bg = composite(bg, backdrop);
+    if (fg[3] < 1) fg = composite(fg, bg);
+    var l1 = luminance(fg), l2 = luminance(bg);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  }
+  // APCA-W3 0.0.98G Lc (WCAG 3 draft candidate; informative only). Positive = dark on light.
+  function apcaLc(fg, bg, backdrop) {
+    backdrop = backdrop || [1, 1, 1, 1];
+    if (bg[3] < 1) bg = composite(bg, backdrop);
+    if (fg[3] < 1) fg = composite(fg, bg);
+    var y = function (c) {
+      var v = 0.2126729 * Math.pow(c[0], 2.4) + 0.7151522 * Math.pow(c[1], 2.4) + 0.0721750 * Math.pow(c[2], 2.4);
+      return v < 0.022 ? v + Math.pow(0.022 - v, 1.414) : v;
+    };
+    var yt = y(fg), yb = y(bg), out;
+    if (Math.abs(yb - yt) < 0.0005) return 0;
+    if (yb > yt) { var s1 = (Math.pow(yb, 0.56) - Math.pow(yt, 0.57)) * 1.14; out = s1 < 0.1 ? 0 : s1 - 0.027; }
+    else { var s2 = (Math.pow(yb, 0.65) - Math.pow(yt, 0.62)) * 1.14; out = s2 > -0.1 ? 0 : s2 + 0.027; }
+    return out * 100;
+  }
+  var APCA_MIN = { text: 60, heading: 45, "non-text": 30 };
+  function hls(c) { return rgbToHls(c[0], c[1], c[2]); }
+  function chroma(c) { return Math.max(c[0], c[1], c[2]) - Math.min(c[0], c[1], c[2]); }
+
+  // ---------------------------------------------------------------- naming
+  var HUES = new Set(["red", "blue", "green", "yellow", "orange", "purple", "violet", "pink", "grey", "gray", "teal", "cyan",
+    "magenta", "brown", "black", "white", "lime", "indigo", "amber", "rose", "emerald", "sky", "slate", "zinc", "stone", "neutral"]);
+  var STATES = new Set(["hover", "hovered", "pressed", "active", "selected", "focus", "focused", "disabled", "visited", "dragged", "checked"]);
+  var ROLE_WORDS = {
+    focus: new Set(["focus", "ring", "focusring"]),
+    border: new Set(["border", "outline", "stroke", "divider", "separator"]),
+    icon: new Set(["icon", "icons"]),
+    text: new Set(["text", "foreground", "fg", "content", "label", "heading", "body", "title", "copy"]),
+    bg: new Set(["surface", "background", "bg", "canvas", "container", "fill", "layer", "backdrop", "page"]),
+  };
+  var SCRIM = ["scrim", "overlay", "shadow"];
+
+  function slug(s) {
+    s = String(s).replace(/([a-z0-9])([A-Z])/g, "$1-$2").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase();
+    return s || "x";
+  }
+  function cssVarFor(name) { return "--" + slug(name.split("/").join("-")); }
+  function segments(name) {
+    return name.replace(/([a-z0-9])([A-Z])/g, "$1-$2").toLowerCase().split(/[\/\-_. ]+/).filter(Boolean);
+  }
+  function onTarget(name) {
+    var ls = lastSeg(name);
+    var m = /^on[-_ ]?(.+)$/i.exec(ls);
+    var c = ls.slice(2, 3);
+    if (m && ("-_ ".indexOf(c) >= 0 || (c.toUpperCase() === c && c.toLowerCase() !== c))) return slug(m[1]);
+    var parts = name.toLowerCase().split("/");
+    var i = parts.slice(0, -1).indexOf("on");
+    if (i >= 0) return slug(parts.slice(i + 1).join("-"));
+    return null;
+  }
+  function roleOf(name) {
+    var segs = segments(name);
+    if (onTarget(name)) return segs.some(function (s) { return ROLE_WORDS.icon.has(s); }) ? "icon" : "text";
+    var order = ["focus", "border", "icon", "text", "bg"];
+    for (var i = 0; i < order.length; i++) if (segs.some(function (s) { return ROLE_WORDS[order[i]].has(s); })) return order[i];
+    return null;
+  }
+  function floatKind(name) {
+    var n = segments(name).join("-");
+    var rules = [
+      ["font-weight", /weight/], ["line-height", /line-height|leading/], ["letter-spacing", /letter-spacing|tracking/],
+      ["font-size", /font-size|text-size|font-.*size|typography.*size|^size-(xs|sm|md|lg|xl)/],
+      ["radius", /radius|corner|rounded/], ["border-width", /border-width|stroke-width|^border-\d/],
+      ["opacity", /opacity|alpha/], ["z-index", /z-index|zindex|^z-|elevation-z/],
+      ["duration", /duration|delay|motion-time/], ["spacing", /spacing|space|gap|padding|margin|inset|gutter/],
+      ["size", /size|width|height|target|icon/],
+    ];
+    for (var i = 0; i < rules.length; i++) if (rules[i][1].test(n)) return rules[i][0];
+    return "number";
+  }
+  var UNITLESS = new Set(["font-weight", "opacity", "z-index", "number"]);
+
+  // ---------------------------------------------------------------- model
+  var TIER_ORDER = { primitive: 0, alias: 1, other: 1, mapped: 2, responsive: 2 };
+  function newModel(kind, file) { return { format: "tokenkit/model@1", source: { kind: kind, file: file || null }, collections: [], tokens: [] }; }
+  function colByName(model) { var o = {}; model.collections.forEach(function (c) { o[c.name] = c; }); return o; }
+  function tokIndex(model) { var o = {}; model.tokens.forEach(function (t) { o[t.key] = t; }); return o; }
+  function refOf(t) { return t.collection + "::" + t.name; }
+  function tiersOf(model) { var o = {}; model.collections.forEach(function (c) { o[c.name] = c.tier; }); return o; }
+
+  function guessTier(name) {
+    var n = name.toLowerCase();
+    if (/primitiv|brand|base|core|palette|foundation|global|raw/.test(n)) return "primitive";
+    if (/alias|semantic|ramp/.test(n)) return "alias";
+    if (/mapped|theme|mode|scheme|color/.test(n)) return "mapped";
+    if (/responsive|breakpoint|device|viewport|layout|density/.test(n)) return "responsive";
+    return null;
+  }
+  function inferTiers(model) {
+    var byCol = {};
+    model.tokens.forEach(function (t) { (byCol[t.collection] = byCol[t.collection] || []).push(t); });
+    model.collections.forEach(function (c) {
+      if (c.tier) return;
+      var ts = byCol[c.name] || [];
+      var vals = [];
+      ts.forEach(function (t) { Object.keys(t.values).forEach(function (k) { vals.push(t.values[k]); }); });
+      var lit = vals.filter(function (v) { return has(v, "value"); }).length;
+      var guess = guessTier(c.name);
+      if (c.modes.length > 1) {
+        var colors = ts.filter(function (t) { return t.type === "COLOR"; }).length;
+        c.tier = (guess === "mapped" || guess === "responsive") ? guess : (colors >= ts.length / 2 ? "mapped" : "responsive");
+      } else if (guess) c.tier = guess;
+      else if (vals.length && lit === vals.length) c.tier = "primitive";
+      else c.tier = "alias";
+    });
+  }
+  function assignCssVars(model) {
+    model.tokens.forEach(function (t) {
+      var web = (t.codeSyntax || {}).WEB || "";
+      var m = /(--[\w-]+)/.exec(web);
+      t.cssVar = t.cssVar || (m ? m[1] : cssVarFor(t.name));
+    });
+  }
+
+  // ---------------------------------------------------------------- ingest figma
+  function ingestFigma(data, file) {
+    var model = newModel("figma", file);
+    var cols, vars;
+    if (data.meta) {
+      cols = Object.keys(data.meta.variableCollections || {}).map(function (k) { return data.meta.variableCollections[k]; });
+      vars = Object.keys(data.meta.variables || {}).map(function (k) { return data.meta.variables[k]; });
+    } else { cols = data.collections || []; vars = data.variables || []; }
+    model.source.fileName = data.fileName || null;
+    var colMap = {};
+    cols.forEach(function (c) {
+      if (c.remote) return;
+      var modes = c.modes.map(function (m) { return { name: m.name, figmaId: m.modeId || m.id, selector: null }; });
+      var def = c.defaultModeId || modes[0].figmaId;
+      modes = modes.filter(function (m) { return m.figmaId === def; }).concat(modes.filter(function (m) { return m.figmaId !== def; }));
+      var col = { name: c.name, figmaId: c.id, tier: null, modes: modes };
+      colMap[c.id] = col;
+      model.collections.push(col);
+    });
+    vars.forEach(function (v) {
+      var col = colMap[v.variableCollectionId];
+      if (!col || v.remote) return;
+      var modeName = {};
+      col.modes.forEach(function (m) { modeName[m.figmaId] = m.name; });
+      var values = {};
+      Object.keys(v.valuesByMode || {}).forEach(function (mid) {
+        var mname = modeName[mid], val = v.valuesByMode[mid];
+        if (mname === undefined) return;
+        if (val && typeof val === "object" && val.type === "VARIABLE_ALIAS") values[mname] = { alias: val.id };
+        else if (v.resolvedType === "COLOR") values[mname] = { value: toHex(parseColor(val)) };
+        else values[mname] = { value: val };
+      });
+      model.tokens.push({ key: v.id, name: v.name, collection: col.name, figmaId: v.id, type: v.resolvedType,
+        scopes: v.scopes === undefined ? null : v.scopes, description: v.description || "", codeSyntax: v.codeSyntax || {},
+        cssVar: null, values: values, hidden: !!v.hiddenFromPublishing });
+    });
+    var keys = new Set(model.tokens.map(function (t) { return t.key; }));
+    model.tokens.forEach(function (t) {
+      Object.keys(t.values).forEach(function (m) { var v = t.values[m]; if (has(v, "alias") && !keys.has(v.alias)) v.external = true; });
+    });
+    inferTiers(model);
+    assignCssVars(model);
+    return model;
+  }
+
+  // ---------------------------------------------------------------- ingest css
+  function parseCss(text) {
+    var out = [], stack = [], buf = "", annot = null, pos = 0, m;
+    var re = /\/\*[\s\S]*?\*\/|[{};]/g;
+    var isAt = function (f) { return f.prelude.charAt(0) === "@"; };
+    var addDecl = function (d) {
+      var i = d.indexOf(":");
+      stack[stack.length - 1].decls.push([d.slice(0, i).trim(), d.slice(i + 1).trim()]);
+    };
+    while ((m = re.exec(text))) {
+      buf += text.slice(pos, m.index);
+      pos = re.lastIndex;
+      var tk = m[0];
+      if (tk.indexOf("/*") === 0) {
+        if (tk.indexOf("@collection") >= 0) {
+          annot = {};
+          var r2 = /@(\w+)\s+([^@*]*)/g, mm;
+          while ((mm = r2.exec(tk))) annot[mm[1]] = mm[2].trim();
+        }
+        continue;
+      }
+      if (tk === "{") {
+        var prelude = buf.trim(); buf = "";
+        var frame = { prelude: prelude, annot: annot, decls: [] };
+        if (prelude.charAt(0) !== "@") annot = null;
+        stack.push(frame);
+      } else if (tk === ";") {
+        if (stack.length && !isAt(stack[stack.length - 1])) { var d = buf.trim(); if (d.indexOf(":") >= 0) addDecl(d); }
+        buf = "";
+      } else {
+        var d2 = buf.trim();
+        if (stack.length && d2 && d2.indexOf(":") >= 0 && !isAt(stack[stack.length - 1])) addDecl(d2);
+        buf = "";
+        if (!stack.length) continue;
+        var fr = stack.pop();
+        if (isAt(fr)) continue;
+        var media = stack.filter(function (f) { return f.prelude.indexOf("@media") === 0; }).map(function (f) { return f.prelude; }).join(" and ");
+        var an = fr.annot;
+        if (!an) for (var i = stack.length - 1; i >= 0; i--) if (stack[i].annot) { an = stack[i].annot; break; }
+        out.push({ media: media, selector: fr.prelude, annot: an || null, decls: fr.decls });
+      }
+    }
+    return out;
+  }
+  function cssContext(media, selector) {
+    var sels = selector.split(",").map(function (s) { return s.trim(); });
+    var base = sels.some(function (s) { return [":root", "html", ":host", "body"].indexOf(s) >= 0; }) && !media;
+    var hint = null;
+    sels.forEach(function (s) {
+      var m = /data-theme\s*=\s*['"]?([\w-]+)/.exec(s) || /\.(?:theme-)?(dark|light|dim|high-contrast)\b/.exec(s);
+      if (m) hint = m[1];
+    });
+    if (base) return ["base", hint, true];
+    if (media) {
+      if (media.indexOf("prefers-color-scheme") >= 0) return ["theme", media.indexOf("dark") >= 0 ? "dark" : "light", false];
+      var mw = /(max|min)-width\s*:\s*([\d.]+)(px|em|rem)?/.exec(media);
+      if (mw) return ["viewport", mw[1] + "-" + mw[2] + (mw[3] || "px"), false];
+      return ["media", slug(media), false];
+    }
+    if (hint) return ["theme", hint, false];
+    for (var i = 0; i < sels.length; i++) {
+      var m2 = /data-([\w-]+)\s*=\s*['"]?([\w-]+)/.exec(sels[i]);
+      if (m2) return [m2[1], m2[2], false];
+    }
+    return ["selector", slug(selector), false];
+  }
+  function parseCssValue(raw) {
+    var v = raw.trim().replace(/\s*!important\s*$/, "");
+    var m = /^var\(\s*(--[\w-]+)\s*(?:,\s*([\s\S]+))?\)$/.exec(v);
+    if (m) return [{ alias: m[1] }, null, m[2] ? "fallback ignored" : null];
+    var c = parseColor(v);
+    if (c) return [{ value: toHex(c) }, "COLOR", null];
+    m = /^(-?\d*\.?\d+)(px|rem|em)?$/.exec(v);
+    if (m) {
+      var n = Number(m[1]), note = null;
+      if (m[2] === "rem" || m[2] === "em") { n *= 16; note = m[2] + " converted to px (16px base)"; }
+      n = n === Math.trunc(n) ? Math.trunc(n) : pyRound(n, 4);
+      return [{ value: n }, "FLOAT", note];
+    }
+    var note2 = /\(/.test(v) ? "expression not representable as a Figma variable" : null;
+    m = /^'([^']*)'$|^"([^"]*)"$/.exec(v);
+    return [{ value: m ? (m[1] || m[2] || "") : v }, "STRING", note2];
+  }
+  function looksPrimitive(name) {
+    var s = segments(name);
+    return s.length > 0 && (isDigits(s[s.length - 1]) || s.some(function (x) { return HUES.has(x); }));
+  }
+  function titleCase(s) { return s.replace(/\w\S*/g, function (w) { return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase(); }); }
+
+  function ingestCss(text, manifest, file) {
+    var model = newModel("css", file);
+    var blocks = parseCss(text);
+    var manTok = {}, manCol = {};
+    ((manifest || {}).tokens || []).forEach(function (t) { manTok[t.cssVar] = t; });
+    ((manifest || {}).collections || []).forEach(function (c) { manCol[c.name] = c; });
+    var defs = new Map(), baseHint = null;
+    var annotated = blocks.some(function (b) { return b.annot; });
+    blocks.forEach(function (b) {
+      var props = b.decls.filter(function (d) { return d[0].indexOf("--") === 0; });
+      if (!props.length) return;
+      var selFull = b.media ? b.media + " { " + b.selector + " }" : b.selector;
+      if (annotated && b.annot) {
+        var a = b.annot, rawMode = a.mode || "Value";
+        props.forEach(function (p) {
+          pushMap(defs, p[0], { col: a.collection, tier: a.tier, mode: rawMode.replace(/\s*\(default\)\s*$/, ""), sel: selFull, raw: p[1], "default": rawMode.indexOf("(default)") >= 0 });
+        });
+        return;
+      }
+      var ctx = cssContext(b.media, b.selector);
+      if (ctx[2] && ctx[1]) baseHint = ctx[1];
+      props.forEach(function (p) { pushMap(defs, p[0], { fam: ctx[2] ? "base" : ctx[0], mode: ctx[1], sel: selFull, raw: p[1] }); });
+    });
+    var cols = new Map();
+    var getCol = function (name, tier) {
+      if (!cols.has(name)) { var mc = manCol[name] || {}; cols.set(name, { name: name, figmaId: mc.figmaId || null, tier: tier || mc.tier || null, modes: [] }); }
+      return cols.get(name);
+    };
+    var addMode = function (col, mode, sel, dflt) {
+      if (col.modes.some(function (m) { return m.name === mode; })) return;
+      var mid = null;
+      ((manCol[col.name] || {}).modes || []).forEach(function (mm) { if (mid === null && mm.name === mode) mid = mm.figmaId || null; });
+      var e = { name: mode, figmaId: mid, selector: sel };
+      if (dflt) col.modes.unshift(e); else col.modes.push(e);
+    };
+    var tokens = [];
+    if (annotated) {
+      defs.forEach(function (ds, v) {
+        var col = getCol(ds[0].col, ds[0].tier);
+        ds.forEach(function (d) { addMode(col, d.mode, d.sel, d["default"]); });
+        tokens.push([v, col.name, ds.map(function (d) { return [d.mode, d.raw]; })]);
+      });
+    } else {
+      var refd = new Set(), famModes = new Map();
+      defs.forEach(function (ds) {
+        ds.forEach(function (d) {
+          var m = /var\(\s*(--[\w-]+)/.exec(d.raw); if (m) refd.add(m[1]);
+          if (d.fam !== "base") { if (!famModes.has(d.fam)) famModes.set(d.fam, new Set()); famModes.get(d.fam).add(d.mode); }
+        });
+      });
+      var famNames = { theme: "Theme", viewport: "Responsive" };
+      defs.forEach(function (ds, v) {
+        var fams = ds.filter(function (d) { return d.fam !== "base"; }).map(function (d) { return d.fam; });
+        if (fams.length) {
+          var fam = fams[0];
+          var cname = famNames[fam] || titleCase(fam.replace(/-/g, " "));
+          var col = getCol(cname, fam === "viewport" ? "responsive" : "mapped");
+          var fm = famModes.get(fam), baseName;
+          if (fam === "theme") baseName = baseHint || (fm.has("dark") ? "light" : "default");
+          else if (fam === "viewport") baseName = Array.from(fm).some(function (x) { return x.indexOf("max") === 0; }) ? "desktop" : "mobile";
+          else baseName = "default";
+          var vals = [];
+          ds.forEach(function (d) {
+            if (d.fam === "base") { addMode(col, baseName, ":root", true); vals.push([baseName, d.raw]); }
+            else if (d.fam === fam) { addMode(col, d.mode, d.sel); vals.push([d.mode, d.raw]); }
+          });
+          tokens.push([v, cname, vals]);
+        } else {
+          var raw = ds[ds.length - 1].raw;
+          var isRef = raw.trim().indexOf("var(") === 0;
+          var c2 = (!isRef && (refd.has(v) || looksPrimitive(v.slice(2)))) ? getCol("Primitives", "primitive") : getCol("Semantic", "alias");
+          addMode(c2, "Value", ":root", true);
+          tokens.push([v, c2.name, [["Value", raw]]]);
+        }
+      });
+      cols.forEach(function (c) {
+        if ((c.tier === "mapped" || c.tier === "responsive") && !c.modes.some(function (m) { return m.selector === ":root"; })) {
+          c.modes.unshift({ name: baseHint || "default", figmaId: null, selector: ":root" });
+        }
+      });
+    }
+    model.collections = Array.from(cols.values());
+    tokens.forEach(function (x) {
+      var v = x[0], mt = manTok[v] || {};
+      var t = { key: mt.figmaId || "css:" + v, name: mt.name || v.slice(2).replace(/-/g, "/"), collection: x[1],
+        figmaId: mt.figmaId || null, type: null, scopes: has(mt, "scopes") ? mt.scopes : null, description: mt.description || "",
+        codeSyntax: mt.codeSyntax || {}, cssVar: v, values: {}, notes: [] };
+      x[2].forEach(function (mr) {
+        var p = parseCssValue(mr[1]);
+        t.values[mr[0]] = p[0];
+        if (p[1] && !t.type) t.type = p[1];
+        if (p[2]) t.notes.push(mr[0] + ": " + p[2]);
+      });
+      model.tokens.push(t);
+    });
+    var byVar = {}, byKey = {};
+    model.tokens.forEach(function (t) { byVar[t.cssVar] = t; byKey[t.key] = t; });
+    model.tokens.forEach(function (t) {
+      Object.keys(t.values).forEach(function (m) {
+        var v = t.values[m];
+        if (has(v, "alias")) { var tg = byVar[v.alias]; if (tg) v.alias = tg.key; else v.external = true; }
+      });
+    });
+    for (var it = 0; it < 10; it++) {
+      model.tokens.forEach(function (t) {
+        if (t.type) return;
+        var ks = Object.keys(t.values);
+        for (var i = 0; i < ks.length; i++) {
+          var v = t.values[ks[i]];
+          var tg = v.external ? byVar[v.alias] : byKey[v.alias];
+          if (tg && tg.type) { t.type = tg.type; break; }
+        }
+      });
+    }
+    model.tokens.forEach(function (t) { t.type = t.type || "STRING"; });
+    inferTiers(model);
+    return model;
+  }
+
+  // ---------------------------------------------------------------- ingest manifest
+  function ingestManifest(man, file) {
+    var model = newModel("manifest", file);
+    model.collections = man.collections.map(function (c) {
+      return { name: c.name, figmaId: c.figmaId || null, tier: c.tier || null, modes: c.modes.map(function (m) { return Object.assign({}, m); }) };
+    });
+    var keyOf = {};
+    man.tokens.forEach(function (t) { keyOf[t.collection + "::" + t.name] = t.figmaId || "css:" + t.cssVar; });
+    man.tokens.forEach(function (t) {
+      var vals = {};
+      Object.keys(t.values).forEach(function (m) {
+        var v = t.values[m];
+        if (has(v, "alias")) { var a = v.alias; vals[m] = { alias: a.figmaId || keyOf[a.collection + "::" + a.name] || "css:" + (a.cssVar || "") }; }
+        else vals[m] = { value: v.value };
+      });
+      model.tokens.push({ key: keyOf[t.collection + "::" + t.name], name: t.name, collection: t.collection, figmaId: t.figmaId || null, type: t.type,
+        scopes: has(t, "scopes") ? t.scopes : null, description: t.description || "", codeSyntax: t.codeSyntax || {}, cssVar: t.cssVar, values: vals });
+    });
+    inferTiers(model);
+    return model;
+  }
+
+  // ---------------------------------------------------------------- resolver
+  function Resolver(model) { this.m = model; this.idx = tokIndex(model); this.cols = colByName(model); }
+  Resolver.prototype.modeFor = function (tok, mode) {
+    var modes = this.cols[tok.collection].modes.map(function (m) { return m.name; });
+    return modes.indexOf(mode) >= 0 ? mode : (modes.length ? modes[0] : null);
+  };
+  Resolver.prototype.resolve = function (key, mode, seen) {
+    seen = seen || [];
+    var tok = this.idx[key];
+    if (!tok) return { value: null, chain: seen.slice(), error: "broken" };
+    if (seen.indexOf(key) >= 0) return { value: null, chain: seen.concat([key]), error: "cycle" };
+    var m = this.modeFor(tok, mode);
+    var e = tok.values[m];
+    if (e === undefined) return { value: null, chain: seen.concat([key]), error: "missing", mode: m };
+    if (has(e, "alias")) {
+      if (e.external) return { value: null, chain: seen.concat([key]), error: "external" };
+      return this.resolve(e.alias, mode, seen.concat([key]));
+    }
+    return { value: e.value, chain: seen.concat([key]), error: null };
+  };
+  Resolver.prototype.color = function (key, mode) {
+    var r = this.resolve(key, mode);
+    return r.error === null ? parseColor(r.value) : null;
+  };
+
+  // ---------------------------------------------------------------- audit
+  function F(area, id, severity, title, detail, tokens, fix) {
+    var u = uniqSorted(tokens);
+    return { area: area, id: id, severity: severity, title: title, detail: detail || "", tokens: u.slice(0, 60), count: u.length, fix: fix || "decision" };
+  }
+  function evalModes(res) {
+    var toks = Array.prototype.slice.call(arguments, 1), names = [], multi = [];
+    toks.forEach(function (t) {
+      var ms = res.cols[t.collection].modes;
+      ms.forEach(function (m) { if (names.indexOf(m.name) < 0) names.push(m.name); });
+      if (ms.length > 1) ms.forEach(function (m) { if (multi.indexOf(m.name) < 0) multi.push(m.name); });
+    });
+    return multi.length ? multi : names.slice(0, 1);
+  }
+
+  function auditStructure(model, res) {
+    var out = [], tiers = tiersOf(model), present = new Set(Object.keys(tiers).map(function (k) { return tiers[k]; })), idx = res.idx;
+    if (!present.has("primitive")) out.push(F("structure", "S1", "error", "No primitive layer", "Every value is defined directly in semantic tokens; there is no palette/scale to reference."));
+    if (!["alias", "mapped", "responsive"].some(function (x) { return present.has(x); })) out.push(F("structure", "S1b", "warning", "No semantic layer", "Only raw values exist; components would bind to primitives directly."));
+    var hard = new Map();
+    model.tokens.forEach(function (t) {
+      if (tiers[t.collection] !== "primitive" && Object.keys(t.values).some(function (k) { return has(t.values[k], "value"); })) pushMap(hard, t.type, refOf(t));
+    });
+    hard.forEach(function (lst, typ) {
+      out.push(F("structure", "S2", typ === "COLOR" ? "error" : "warning", "Hardcoded " + typ.toLowerCase() + " values in semantic tokens",
+        "These tokens hold a raw value instead of referencing a primitive.", lst, "auto"));
+    });
+    var broken = [], cycles = [], external = [], missing = [], upward = [], skip = [], deep = [];
+    var hasAlias = present.has("alias");
+    model.tokens.forEach(function (t) {
+      res.cols[t.collection].modes.forEach(function (m) { if (!has(t.values, m.name)) missing.push(refOf(t) + " (" + m.name + ")"); });
+      Object.keys(t.values).forEach(function (mname) {
+        var v = t.values[mname];
+        if (!has(v, "alias")) return;
+        if (v.external) { external.push(refOf(t)); return; }
+        var tgt = idx[v.alias];
+        if (!tgt) { broken.push(refOf(t)); return; }
+        var r = res.resolve(t.key, mname);
+        if (r.error === "cycle") cycles.push(refOf(t));
+        if (r.chain.length > 4) deep.push(refOf(t));
+        if (TIER_ORDER[tiers[tgt.collection]] > TIER_ORDER[tiers[t.collection]]) upward.push(refOf(t) + " -> " + refOf(tgt));
+        if ((tiers[t.collection] === "mapped" || tiers[t.collection] === "responsive") && tiers[tgt.collection] === "primitive" && hasAlias && t.type === "COLOR") skip.push(refOf(t));
+      });
+    });
+    if (broken.length) out.push(F("structure", "S4", "error", "Broken aliases", "Alias targets that do not exist.", broken));
+    if (cycles.length) out.push(F("structure", "S4b", "error", "Circular aliases", "", cycles));
+    if (external.length) out.push(F("structure", "S4c", "info", "Aliases to external libraries", "Targets live in another file/library and cannot be resolved here.", external));
+    if (missing.length) out.push(F("structure", "S5", "error", "Missing values per mode", "Token has no value in some mode of its collection.", missing));
+    if (upward.length) out.push(F("structure", "S3", "error", "Upward references", "A lower tier references a higher tier (e.g. primitive -> semantic). Breaks theming.", upward));
+    if (skip.length) out.push(F("structure", "S3b", "info", "Tier skipping", "Mapped tokens point at primitives directly although an alias tier exists.", skip));
+    if (deep.length) out.push(F("structure", "S10", "warning", "Alias chains deeper than 3", "", deep));
+    var upper = model.tokens.filter(function (t) { return /[A-Z]/.test(t.name); }).map(refOf);
+    var spaces = model.tokens.filter(function (t) { return t.name.indexOf(" ") >= 0; }).map(refOf);
+    var style = new Map(), perStyle = new Map();
+    model.tokens.forEach(function (t) {
+      t.name.split("/").forEach(function (s) {
+        var st = /[a-z][A-Z]/.test(s) ? "camel" : s.indexOf("_") >= 0 ? "snake" : s.indexOf("-") >= 0 ? "kebab" : null;
+        if (st) { inc(style, st); pushMap(perStyle, st, refOf(t)); }
+      });
+    });
+    if (upper.length) out.push(F("structure", "S6a", "warning", "Uppercase in token names", "Mixed case makes names harder to map to code.", upper));
+    if (spaces.length) out.push(F("structure", "S6b", "warning", "Spaces in token names", "", spaces));
+    if (style.size > 1) {
+      var dom = mostCommon(style), odd = [];
+      perStyle.forEach(function (l, st) { if (st !== dom) odd = odd.concat(l); });
+      out.push(F("structure", "S6c", "warning", "Mixed word separators (dominant: " + dom + ")", "", odd));
+    }
+    var seenCss = new Map();
+    model.tokens.forEach(function (t) { pushMap(seenCss, t.cssVar, refOf(t)); });
+    var coll = [];
+    seenCss.forEach(function (l) { if (l.length > 1) coll = coll.concat(l); });
+    if (coll.length) out.push(F("structure", "S6d", "error", "CSS name collisions", "Different tokens map to the same CSS custom property.", coll));
+    var depth = new Map();
+    model.tokens.forEach(function (t) {
+      var k = t.collection + "\u0000" + t.name.split("/")[0];
+      if (!depth.has(k)) depth.set(k, new Set());
+      depth.get(k).add(t.name.split("/").length);
+    });
+    var irregular = [];
+    depth.forEach(function (d, k) {
+      if (d.size > 2) { var p = k.split("\u0000"); irregular.push(p[0] + "::" + p[1] + "/* depths " + pyList(Array.from(d).sort(function (a, b) { return a - b; }))); }
+    });
+    if (irregular.length) out.push(F("structure", "S6e", "info", "Irregular naming depth", "Groups whose tokens use more than two different path depths.", irregular));
+    var ramps = new Map();
+    model.tokens.forEach(function (t) {
+      if (tiers[t.collection] === "primitive" && t.type === "COLOR" && isDigits(lastSeg(t.name))) pushMap(ramps, t.collection + "::" + parentOf(t.name), t);
+    });
+    var stepSets = new Map();
+    ramps.forEach(function (ts) {
+      if (ts.length > 3) inc(stepSets, ts.map(function (t) { return Number(lastSeg(t.name)); }).sort(function (a, b) { return a - b; }).join(","));
+    });
+    if (stepSets.size) {
+      var canonical = mostCommon(stepSets).split(",").map(Number);
+      var gaps = [], nonmono = [];
+      ramps.forEach(function (ts, rname) {
+        var steps = new Set(ts.map(function (t) { return Number(lastSeg(t.name)); }));
+        var miss = canonical.filter(function (s) { return !steps.has(s); }).sort(function (a, b) { return a - b; });
+        if (ts.length > 3 && miss.length) gaps.push(rname + " missing " + pyList(miss));
+        var ls = ts.slice().sort(function (a, b) { return Number(lastSeg(a.name)) - Number(lastSeg(b.name)); })
+          .map(function (t) { return hls(res.color(t.key, null) || [0, 0, 0, 1])[1]; });
+        var diffs = [];
+        for (var i = 1; i < ls.length; i++) if (Math.abs(ls[i] - ls[i - 1]) > 0.005) diffs.push(ls[i] - ls[i - 1]);
+        if (diffs.length && diffs.some(function (d) { return d > 0; }) && diffs.some(function (d) { return d < 0; })) nonmono.push(rname);
+      });
+      if (gaps.length) out.push(F("structure", "S7", "info", "Ramp gaps", "Ramps missing steps that most other ramps have.", gaps));
+      if (nonmono.length) out.push(F("structure", "S7b", "warning", "Non-monotonic ramps", "Lightness does not change in one direction along the steps.", nonmono));
+    }
+    var byVal = new Map();
+    model.tokens.forEach(function (t) {
+      if (tiers[t.collection] !== "primitive") return;
+      var v = firstVal(t).value;
+      if (v !== undefined && v !== null) pushMap(byVal, t.type + "\u0000" + JSON.stringify(v), refOf(t));
+    });
+    var dups = [];
+    byVal.forEach(function (l, k) {
+      var p = k.split("\u0000");
+      if (l.length > 1 && p[0] === "COLOR") dups.push(JSON.parse(p[1]) + " = " + l.join(", "));
+    });
+    if (dups.length) out.push(F("structure", "S8", "warning", "Duplicate primitive colors", "Same value under several names.", dups));
+    var refd = new Set();
+    model.tokens.forEach(function (t) { Object.keys(t.values).forEach(function (m) { if (has(t.values[m], "alias")) refd.add(t.values[m].alias); }); });
+    var prims = model.tokens.filter(function (t) { return tiers[t.collection] === "primitive"; });
+    var unused = prims.filter(function (t) { return !refd.has(t.key); }).map(refOf);
+    if (unused.length && unused.length < prims.length) out.push(F("structure", "S9", "info", "Unused primitives", "Not referenced by any semantic token (fine for palette completeness).", unused));
+    return out;
+  }
+
+  function backdropFor(mode) { return mode && /dark|night|dim/i.test(mode) ? [0, 0, 0, 1] : [1, 1, 1, 1]; }
+
+  function auditAccessibility(model, res, pairs) {
+    var tiers = tiersOf(model);
+    var sem = model.tokens.filter(function (t) { return t.type === "COLOR" && tiers[t.collection] !== "primitive"; });
+    var checks = [], findings = [];
+    if (!sem.length) {
+      findings.push(F("accessibility", "A0", "warning", "No semantic color tokens", "Contrast pairs cannot be inferred from primitives alone. Provide a pairs file or add semantic tokens."));
+      return [findings, checks];
+    }
+    var roles = {}, inverse = new Set();
+    sem.forEach(function (t) {
+      roles[t.key] = roleOf(t.name);
+      var s = segments(t.name);
+      if (s.indexOf("inverse") >= 0 || s.indexOf("inverted") >= 0) inverse.add(t.key);
+    });
+    var isNeutral = function (t) {
+      var ms = evalModes(res, t);
+      for (var i = 0; i < ms.length; i++) { var c = res.color(t.key, ms[i]); if (!c || chroma(c) > 0.1 || c[3] < 0.99) return false; }
+      return true;
+    };
+    var bgs = sem.filter(function (t) { return roles[t.key] === "bg" && !segments(t.name).some(function (s) { return SCRIM.indexOf(s) >= 0; }); });
+    var neutralBgs = bgs.filter(function (t) {
+      return isNeutral(t) && !inverse.has(t.key) && !segments(t.name).some(function (s) { return s === "disabled" || s === "inactive"; });
+    });
+    var byLast = new Map();
+    sem.forEach(function (t) {
+      if (["text", "icon", "border", "focus"].indexOf(roles[t.key]) < 0) pushMap(byLast, slug(lastSeg(t.name)), t);
+      if (roles[t.key] === "bg") pushMap(byLast, slug(t.name.split("/").slice(1).join("-") || t.name), t);
+    });
+    var addCheck = function (fg, bg, min, kind, note) {
+      evalModes(res, fg, bg).forEach(function (m) {
+        var cf = res.color(fg.key, m), cb = res.color(bg.key, m);
+        if (!cf || !cb) return;
+        var r = contrast(cf, cb, backdropFor(m));
+        var lc = apcaLc(cf, cb, backdropFor(m));
+        var ak = (note || "").indexOf("3:1") === 0 ? "heading" : (min >= 4.5 ? "text" : "non-text");
+        checks.push({ fg: refOf(fg), bg: refOf(bg), mode: m, ratio: pyRound(r, 2), min: min, pass: r >= min - 1e-9, kind: kind, note: note || "", fgHex: toHex(cf), bgHex: toHex(cb),
+          apca: pyRound(lc, 1), apcaMin: APCA_MIN[ak], apcaPass: Math.abs(lc) >= APCA_MIN[ak] });
+      });
+    };
+    var pairedBg = new Set();
+    sem.forEach(function (t) {
+      var role = roles[t.key];
+      if (["text", "icon", "border", "focus"].indexOf(role) < 0) return;
+      var segs = segments(t.name), segSet = new Set(segs);
+      var disabled = segSet.has("disabled") || segSet.has("inactive");
+      var tgt = onTarget(t.name);
+      var parent = t.name.indexOf("/") >= 0 ? parentOf(t.name) : null;
+      var siblings = !tgt ? bgs.filter(function (b) { return parent && b.collection === t.collection && parentOf(b.name) === parent && b.name.indexOf("/") >= 0; }) : [];
+      if (siblings.length && !disabled) {
+        siblings.forEach(function (b) { pairedBg.add(b.key); addCheck(t, b, role === "text" ? 4.5 : 3.0, "on-pair"); });
+        return;
+      }
+      if (tgt) {
+        (byLast.get(tgt) || []).filter(function (b) { return b.key !== t.key; }).forEach(function (b) {
+          pairedBg.add(b.key); addCheck(t, b, role === "icon" ? 3.0 : 4.5, "on-pair");
+        });
+        return;
+      }
+      if (inverse.has(t.key)) {
+        bgs.filter(function (b) { return inverse.has(b.key); }).forEach(function (b) { addCheck(t, b, role === "text" ? 4.5 : 3.0, "inverse"); });
+        return;
+      }
+      if (disabled) return;
+      neutralBgs.forEach(function (b) {
+        if (role === "text") {
+          var heading = intersects(segSet, ["heading", "display", "headline", "large", "xl"]);
+          addCheck(t, b, 4.5, "text", heading ? "3:1 suffices only for large text (>=24px or >=18.66px bold)" : "");
+        } else if (role === "icon") addCheck(t, b, 3.0, "icon");
+        else if (role === "focus") addCheck(t, b, 3.0, "focus");
+        else {
+          var inter = intersects(segSet, ["input", "control", "field", "interactive", "strong", "emphasis", "checkbox", "radio"]);
+          addCheck(t, b, 3.0, inter ? "border" : "border-decorative", inter ? "" : "decorative borders are exempt from 1.4.11; required if it is the only boundary of a control");
+        }
+      });
+    });
+    if (pairs && pairs.length) {
+      var byRef = {};
+      model.tokens.forEach(function (t) { byRef[refOf(t)] = t; byRef[t.name] = t; byRef[t.cssVar] = t; });
+      pairs.forEach(function (p) {
+        var fg = byRef[p.fg], bg = byRef[p.bg];
+        if (fg && bg) addCheck(fg, bg, Number(p.min || 4.5), "declared");
+        else findings.push(F("accessibility", "A9", "warning", "Declared pair not found", JSON.stringify(p)));
+      });
+    }
+    var fails = checks.filter(function (c) { return !c.pass && c.kind !== "border-decorative"; });
+    var deco = checks.filter(function (c) { return !c.pass && c.kind === "border-decorative"; });
+    [["on-pair", "A1", "Foreground on its paired surface below AA"], ["text", "A2", "Text on neutral surfaces below 4.5:1"],
+      ["inverse", "A2b", "Inverse text below AA"], ["icon", "A3", "Icons below 3:1 (1.4.11)"],
+      ["focus", "A4", "Focus indicator below 3:1 (1.4.11)"], ["border", "A5", "Interactive borders below 3:1 (1.4.11)"],
+      ["declared", "A6", "Declared pairs below minimum"]].forEach(function (k) {
+      var lst = fails.filter(function (c) { return c.kind === k[0]; });
+      if (!lst.length) return;
+      var det = lst.slice().sort(function (a, b) { return a.ratio - b.ratio; }).slice(0, 12).map(function (c) {
+        return c.fg.split("::")[1] + " on " + c.bg.split("::")[1] + " [" + c.mode + "] " + c.ratio.toFixed(2) + "<" + c.min.toFixed(1);
+      }).join("; ");
+      findings.push(F("accessibility", k[1], "error", k[2], det, lst.map(function (c) { return c.fg; })));
+    });
+    if (deco.length) findings.push(F("accessibility", "A5b", "info", "Decorative borders below 3:1", "OK if purely decorative. Must reach 3:1 if it is the only visual boundary of an input or control.", deco.map(function (c) { return c.fg; })));
+    var w3 = checks.filter(function (c) { return c.pass && !c.apcaPass && c.kind !== "border-decorative"; });
+    if (w3.length) findings.push(F("accessibility", "A12", "info", "Pass WCAG 2.2 but low APCA contrast (WCAG 3 draft preview)",
+      "Informative only: WCAG 3 is a Working Draft and its contrast method is not final. Lc shown with APCA guidance (text 60, large 45, non-text 30).", w3.map(function (c) { return c.fg; })));
+    var satBgs = bgs.filter(function (b) { return !pairedBg.has(b.key) && !isNeutral(b) && !inverse.has(b.key); });
+    if (satBgs.length) findings.push(F("accessibility", "A7", "warning", "Colored surfaces without a paired foreground", "Add an on-* token (e.g. text/on-<surface>) so contrast is guaranteed and testable.", satBgs.map(refOf)));
+    if (!sem.some(function (t) { return roles[t.key] === "focus"; })) findings.push(F("accessibility", "A4b", "warning", "No focus token", "Define a focus-ring color token and test it at 3:1 against every surface."));
+    var groups = new Map();
+    var stateList = Array.from(STATES);
+    sem.forEach(function (t) {
+      var base = t.name.split("/").filter(function (s) {
+        var sl = slug(s);
+        return !STATES.has(sl) && !stateList.some(function (st) { return sl.endsWith("-" + st); });
+      }).join("/");
+      pushMap(groups, t.collection + "\u0000" + base, t);
+    });
+    var collide = [];
+    var hasState = function (t) { return segments(t.name).some(function (s) { return STATES.has(s); }); };
+    groups.forEach(function (ts) {
+      if (ts.length < 2 || !ts.some(hasState)) return;
+      for (var i = 0; i < ts.length; i++) for (var j = i + 1; j < ts.length; j++) {
+        var a = ts[i], b = ts[j];
+        if (!(hasState(a) || hasState(b))) continue;
+        var same = evalModes(res, a, b).every(function (m) {
+          return toHex(res.color(a.key, m) || [0, 0, 0, 0]) === toHex(res.color(b.key, m) || [1, 1, 1, 0]);
+        });
+        if (same) collide.push(refOf(a) + " == " + refOf(b));
+      }
+    });
+    if (collide.length) findings.push(F("accessibility", "A8", "warning", "States that look identical", "Different states resolve to the same color in every mode; users cannot tell them apart.", collide));
+    var small = [], target = [];
+    model.tokens.forEach(function (t) {
+      if (t.type !== "FLOAT") return;
+      var k = floatKind(t.name);
+      res.cols[t.collection].modes.forEach(function (m) {
+        var r = res.resolve(t.key, m.name);
+        if (typeof r.value !== "number") return;
+        if (k === "font-size" && r.value < 12) small.push(refOf(t) + " [" + m.name + "] = " + fmtNum(r.value));
+        if (/target|touch|hit|control-height|min-size/.test(segments(t.name).join("-")) && r.value < 24) target.push(refOf(t) + " [" + m.name + "] = " + fmtNum(r.value));
+      });
+    });
+    if (small.length) findings.push(F("accessibility", "A10", "info", "Font sizes below 12px", "Not a WCAG failure but hurts legibility; check 1.4.4 resize behavior.", small));
+    if (target.length) findings.push(F("accessibility", "A11", "warning", "Target sizes below 24px (2.5.8)", "", target));
+    return [findings, checks];
+  }
+
+  function suggestFixes(model, res, checks) {
+    var tiers = tiersOf(model);
+    var req = checks.filter(function (c) { return c.kind !== "border-decorative"; });
+    var by = new Map();
+    req.forEach(function (c) { pushMap(by, c.fg + "\u0000" + c.mode, c); });
+    var refs = {};
+    model.tokens.forEach(function (t) { refs[refOf(t)] = t; });
+    var keys = uniqSorted(req.filter(function (c) { return !c.pass; }).map(function (c) { return c.fg + "\u0000" + c.mode; }));
+    var out = [];
+    keys.forEach(function (key) {
+      var p = key.split("\u0000"), fg = p[0], mode = p[1], t = refs[fg];
+      var r = res.resolve(t.key, mode);
+      if (r.error) return;
+      var cur = parseColor(r.value), prim = res.idx[r.chain[r.chain.length - 1]], bd = backdropFor(mode);
+      var cs = by.get(key);
+      var need = cs.map(function (c) { return [parseColor(c.bgHex), c.min]; });
+      var ok = function (col) { return need.every(function (n) { return contrast(col, n[0], bd) >= n[1] - 1e-9; }); };
+      var stepRef = null, stepHex = null;
+      if (isDigits(lastSeg(prim.name))) {
+        var ramp = parentOf(prim.name), step = Number(lastSeg(prim.name));
+        var cands = model.tokens.filter(function (q) {
+          return q.collection === prim.collection && q.name.indexOf("/") >= 0 && parentOf(q.name) === ramp && isDigits(lastSeg(q.name));
+        }).sort(function (a, b) { return Math.abs(Number(lastSeg(a.name)) - step) - Math.abs(Number(lastSeg(b.name)) - step); });
+        for (var i = 0; i < cands.length; i++) {
+          var col = res.color(cands[i].key, null);
+          if (col && ok(col)) {
+            var cand = cands[i];
+            var mirror = model.tokens.filter(function (a) {
+              return tiers[a.collection] === "alias" && Object.keys(a.values).some(function (k) { return a.values[k].alias === cand.key; });
+            })[0] || null;
+            var use = (mirror && (tiers[t.collection] === "mapped" || tiers[t.collection] === "responsive")) ? mirror : cand;
+            stepRef = refOf(use); stepHex = toHex(col);
+            break;
+          }
+        }
+      }
+      var h = hls(cur), shift = null;
+      outer: for (var s = 1; s <= 400; s++) {
+        var opts = [h[1] - s / 400, h[1] + s / 400];
+        for (var j = 0; j < 2; j++) {
+          var nl = opts[j];
+          if (nl >= 0 && nl <= 1) {
+            var c2 = hlsToRgb(h[0], nl, h[2]).concat([cur[3]]);
+            if (ok(c2)) { shift = c2; break outer; }
+          }
+        }
+      }
+      var worst = cs[0];
+      cs.forEach(function (c) { if (c.ratio < worst.ratio) worst = c; });
+      var sug = { token: fg, mode: mode, current: toHex(cur), worst: worst.bg + " " + worst.ratio.toFixed(2) + "<" + worst.min.toFixed(1),
+        nearestStep: stepRef, nearestStepHex: stepHex, minimalShift: shift ? toHex(shift) : null };
+      if (stepRef) sug.change = { op: "alias", token: fg, mode: mode, to: stepRef };
+      else if (shift) sug.change = { op: "set", token: fg, mode: mode, value: toHex(shift) };
+      out.push(sug);
+    });
+    return out;
+  }
+
+  function auditAi(model, res, structure, a11y) {
+    var tiers = tiersOf(model), toks = model.tokens;
+    var sem = toks.filter(function (t) { return tiers[t.collection] !== "primitive"; });
+    var pct = function (n, d) { return d === 0 ? 100 : pyRound(100 * n / d, 1); };
+    var crit = [];
+    var semVals = [];
+    sem.forEach(function (t) { Object.keys(t.values).forEach(function (k) { semVals.push(t.values[k]); }); });
+    crit.push({ id: "AI1", name: "Semantic tokens reference primitives", weight: 20,
+      score: sem.length ? pct(semVals.filter(function (v) { return has(v, "alias"); }).length, semVals.length) : 0,
+      why: "Agents can reason about intent (surface/danger) and trace it to a value." });
+    var bad = new Set();
+    structure.forEach(function (f) { if (["S6a", "S6b", "S6c", "S6d"].indexOf(f.id) >= 0) f.tokens.forEach(function (x) { bad.add(x); }); });
+    crit.push({ id: "AI2", name: "Predictable, code-safe naming", weight: 15, score: pct(toks.length - bad.size, toks.length),
+      why: "One separator, lowercase, no spaces: names map 1:1 to CSS and code." });
+    crit.push({ id: "AI3", name: "Descriptions on semantic tokens", weight: 15,
+      score: pct(sem.filter(function (t) { return (t.description || "").trim(); }).length, sem.length),
+      why: "Descriptions tell an agent when to use a token, not only what it is." });
+    var hasScopes = (model.source.kind === "figma" || model.source.kind === "manifest") && toks.some(function (t) { return t.scopes !== null && t.scopes !== undefined; });
+    if (hasScopes) crit.push({ id: "AI4", name: "Figma scopes set (not ALL_SCOPES)", weight: 10,
+      score: pct(toks.filter(function (t) { return t.scopes && !(t.scopes.length === 1 && t.scopes[0] === "ALL_SCOPES"); }).length, toks.length),
+      why: "Scopes restrict where a token may be applied, so generated designs bind correctly." });
+    crit.push({ id: "AI5", name: "Explicit code syntax / CSS parity", weight: 10,
+      score: model.source.kind !== "css" ? pct(toks.filter(function (t) { return (t.codeSyntax || {}).WEB; }).length, toks.length) : 100,
+      why: "Figma WEB code syntax lets Dev Mode and MCP return the exact CSS variable." });
+    var leak = [];
+    sem.forEach(function (t) {
+      var segs = segments(t.name), hue = segs.some(function (s) { return HUES.has(s); });
+      var tier = tiers[t.collection];
+      if ((tier === "mapped" || tier === "responsive") && (hue || segs.some(isDigits))) leak.push(refOf(t));
+      else if (tier === "alias" && hue && t.type === "COLOR") leak.push(refOf(t));
+    });
+    var positional = sem.filter(function (t) { return roleOf(t.name) === "bg" && intersects(new Set(segments(t.name)), ["secondary", "tertiary", "quaternary"]); }).map(refOf);
+    crit.push({ id: "AI6", name: "Role-based (not value-based) semantic names", weight: 10,
+      score: sem.length ? pct(sem.length - new Set(leak).size, sem.length) : 0,
+      why: "Names like surface/danger survive a rebrand; names like surface/red do not.", tokens: leak });
+    var integ = structure.filter(function (f) { return ["S4", "S4b", "S5", "S3"].indexOf(f.id) >= 0; }).reduce(function (s, f) { return s + f.count; }, 0);
+    crit.push({ id: "AI7", name: "Integrity (no broken, circular, missing or upward refs)", weight: 10, score: Math.max(0, 100 - 10 * integ),
+      why: "Any unresolved value forces an agent to guess." });
+    var a7 = a11y.filter(function (f) { return f.id === "A7"; })[0];
+    var unpaired = a7 ? a7.count : 0;
+    var bgs = sem.filter(function (t) { return roleOf(t.name) === "bg"; });
+    crit.push({ id: "AI8", name: "Explicit foreground/background pairs", weight: 10,
+      score: bgs.length ? pct(bgs.length - unpaired, bgs.length) : 0,
+      why: "on-* tokens let an agent pick an accessible text color without computing contrast." });
+    var tw = crit.reduce(function (s, c) { return s + c.weight; }, 0);
+    var score = pyRound(crit.reduce(function (s, c) { return s + c.score * c.weight; }, 0) / tw);
+    var extra = positional.length ? [F("ai", "AI6b", "info", "Positional surface names", "secondary/tertiary say nothing about purpose; prefer a role (e.g. surface/brand, surface/accent).", positional)] : [];
+    return [{ score: score, criteria: crit }, extra];
+  }
+
+  function scoreStructure(fs) {
+    var s = 100;
+    fs.forEach(function (f) { s -= { error: 15, warning: 5, info: 1 }[f.severity]; });
+    return Math.max(0, s);
+  }
+
+  function audit(model, pairs) {
+    var res = new Resolver(model);
+    var st = auditStructure(model, res);
+    var ac = auditAccessibility(model, res, pairs);
+    var ai = auditAi(model, res, st, ac[0]);
+    var checks = ac[1];
+    var req = checks.filter(function (c) { return c.kind !== "border-decorative"; });
+    var passed = req.filter(function (c) { return c.pass; }).length;
+    var byType = {};
+    model.tokens.forEach(function (t) { byType[t.type] = (byType[t.type] || 0) + 1; });
+    var byTier = {}, modes = {};
+    model.collections.forEach(function (c) { byTier[c.name] = c.tier; modes[c.name] = c.modes.map(function (m) { return m.name; }); });
+    return {
+      summary: {
+        source: model.source, generatedAt: new Date().toISOString().slice(0, 19),
+        counts: { collections: model.collections.length, tokens: model.tokens.length, byType: byType, byTier: byTier, modes: modes },
+        scores: { structure: scoreStructure(st), accessibility: req.length ? pyRound(100 * passed / req.length) : null, aiReady: ai[0].score },
+        contrastChecks: { total: req.length, failed: req.length - passed },
+      },
+      findings: st.concat(ac[0]).concat(ai[1]), ai: ai[0], contrast: checks, suggestions: suggestFixes(model, res, checks),
+    };
+  }
+
+  // ---------------------------------------------------------------- generate
+  function findToken(model, ref) {
+    var hit;
+    if (ref.indexOf("::") >= 0) {
+      var i = ref.indexOf("::"), c = ref.slice(0, i), n = ref.slice(i + 2);
+      hit = model.tokens.filter(function (t) { return t.collection === c && t.name === n; });
+    } else if (ref.indexOf("--") === 0) hit = model.tokens.filter(function (t) { return t.cssVar === ref; });
+    else hit = model.tokens.filter(function (t) { return t.name === ref; });
+    if (hit.length !== 1) throw new Error("change refers to '" + ref + "': " + hit.length + " matches (use Collection::name)");
+    return hit[0];
+  }
+  function normValue(type, v) {
+    if (type === "COLOR") { var c = parseColor(v); if (!c) throw new Error("invalid color " + v); return toHex(c); }
+    return v;
+  }
+  function valueKey(type, v) { return type === "COLOR" ? toHex(parseColor(v)) : JSON.stringify(v); }
+  function setDefault(t, k, v) { if (!has(t, k)) t[k] = v; }
+
+  function applyChanges(model, changes, log) {
+    var cols = colByName(model);
+    changes.forEach(function (ch) {
+      if (ch.op === "add") {
+        var col = cols[ch.collection];
+        var t = { key: "new:" + ch.collection + "::" + ch.name, name: ch.name, collection: ch.collection, figmaId: null, type: ch.type,
+          scopes: has(ch, "scopes") ? ch.scopes : null, description: ch.description || "", codeSyntax: {}, cssVar: ch.cssVar || cssVarFor(ch.name), values: {}, status: "new" };
+        var vals = (ch.values && typeof ch.values === "object") ? ch.values : (function () { var o = {}; col.modes.forEach(function (m) { o[m.name] = ch.values; }); return o; })();
+        model.tokens.push(t);
+        Object.keys(vals).forEach(function (m) {
+          var v = vals[m];
+          t.values[m] = (v && typeof v === "object") ? { alias: findToken(model, v.alias).key } : { value: normValue(t.type, v) };
+        });
+        log.push({ op: "add", token: refOf(t) });
+        return;
+      }
+      var tok = findToken(model, ch.token);
+      var modes = ch.mode ? [ch.mode] : cols[tok.collection].modes.map(function (m) { return m.name; });
+      if (ch.op === "set") modes.forEach(function (m) { tok.values[m] = { value: normValue(tok.type, ch.value) }; });
+      else if (ch.op === "alias") { var tg = findToken(model, ch.to); modes.forEach(function (m) { tok.values[m] = { alias: tg.key }; }); }
+      else if (ch.op === "rename") {
+        var old = refOf(tok);
+        tok.name = ch.to; tok.cssVar = ch.cssVar || cssVarFor(ch.to);
+        var cs = {}; Object.keys(tok.codeSyntax || {}).forEach(function (k) { if (k !== "WEB") cs[k] = tok.codeSyntax[k]; });
+        tok.codeSyntax = cs; tok.status = "renamed";
+        log.push({ op: "rename", from: old, to: refOf(tok) });
+        return;
+      } else if (ch.op === "describe") tok.description = ch.description;
+      else if (ch.op === "scopes") tok.scopes = ch.scopes;
+      else throw new Error("unknown op " + ch.op);
+      setDefault(tok, "status", "changed");
+      var entry = Object.assign({}, ch); entry.token = refOf(tok);
+      log.push(entry);
+    });
+  }
+
+  function newPrimitiveName(model, primCol, type, value, semTok) {
+    var names = new Set(model.tokens.filter(function (t) { return t.collection === primCol; }).map(function (t) { return t.name; }));
+    if (type === "COLOR") {
+      var c = parseColor(value), h3 = hls(c), h = h3[0], l = h3[1], s = chroma(c);
+      var cprims = model.tokens.filter(function (t) { return t.collection === primCol && t.type === "COLOR"; });
+      var rp = new Map();
+      cprims.forEach(function (t) {
+        if (!isDigits(lastSeg(t.name))) return;
+        var parts = t.name.split("/");
+        inc(rp, parts.length >= 3 ? parts.slice(0, -2).join("/") + "/" : "");
+      });
+      var prefix = rp.size ? mostCommon(rp) : "color/";
+      if (c[3] < 1) {
+        var base = toHex([c[0], c[1], c[2], 1]);
+        for (var i = 0; i < cprims.length; i++) {
+          var v = firstVal(cprims[i]).value;
+          if (v && toHex(parseColor(v)) === base) {
+            var cand = cprims[i].name + "-a" + pyRound(c[3] * 100);
+            if (!names.has(cand)) return cand;
+          }
+        }
+        return prefix + "alpha/" + toHex(c).slice(1);
+      }
+      var hx = toHex(c);
+      if (hx === "#ffffff" || hx === "#000000") {
+        var bw = prefix + (hx === "#ffffff" ? "white" : "black");
+        if (!names.has(bw)) return bw;
+      }
+      var ramps = new Map();
+      model.tokens.forEach(function (t) {
+        if (t.collection === primCol && t.type === "COLOR" && isDigits(lastSeg(t.name))) {
+          var tc = parseColor(t.values[Object.keys(t.values)[0]].value || "#000");
+          if (tc) { var th = hls(tc); pushMap(ramps, parentOf(t.name), [Number(lastSeg(t.name)), [th[0], th[1], chroma(tc)]]); }
+        }
+      });
+      var best = null, bd = 1e9;
+      ramps.forEach(function (entries, rn) {
+        if (entries.length < 3) return;
+        var rs = entries.reduce(function (a, e) { return a + e[1][2]; }, 0) / entries.length;
+        if ((s < 0.08) !== (rs < 0.08)) return;
+        var d;
+        if (s < 0.08) d = Math.abs(rs - s);
+        else {
+          var sy = entries.reduce(function (a, e) { return a + Math.sin(2 * Math.PI * e[1][0]); }, 0);
+          var sx = entries.reduce(function (a, e) { return a + Math.cos(2 * Math.PI * e[1][0]); }, 0);
+          var rh = (((Math.atan2(sy, sx) / (2 * Math.PI)) % 1) + 1) % 1;
+          d = Math.min(Math.abs(rh - h), 1 - Math.abs(rh - h)) * 360;
+          if (d > 20) return;
+        }
+        if (d < bd) { best = rn; bd = d; }
+      });
+      if (best) {
+        var ent = ramps.get(best).slice().sort(function (a, b) { return a[0] - b[0]; });
+        var darkUp = ent[0][1][1] > ent[ent.length - 1][1][1];
+        var step = null;
+        for (var k = 0; k + 1 < ent.length; k++) {
+          var lo = Math.min(ent[k][1][1], ent[k + 1][1][1]), hi = Math.max(ent[k][1][1], ent[k + 1][1][1]);
+          if (lo <= l && l <= hi) { step = Math.floor((ent[k][0] + ent[k + 1][0]) / 2); break; }
+        }
+        if (step === null) {
+          var first = ent[0][0], last = ent[ent.length - 1][0];
+          var lighter = darkUp ? l > ent[0][1][1] : l < ent[0][1][1];
+          step = lighter ? Math.max(1, Math.floor(first / 2)) : last + (last - ent[ent.length - 2][0]);
+        }
+        var rc = best + "/" + step;
+        if (!names.has(rc)) return rc;
+      }
+      return prefix + "extra/" + toHex(c).slice(1);
+    }
+    if (type === "FLOAT") return floatKind(semTok.name) + "/" + String(value).replace(/\./g, "_").replace(/-/g, "neg");
+    var kind = /font|family|typeface/i.test(semTok.name) ? "font-family" : "string";
+    var b = kind + "/" + slug(String(value)).slice(0, 40);
+    return names.has(b) ? b + "-2" : b;
+  }
+
+  function lessName(a, b) { return a.name.length < b.name.length || (a.name.length === b.name.length && a.name < b.name); }
+
+  function enforcePrimitives(model, log, types) {
+    var tiers = tiersOf(model);
+    var primCols = model.collections.filter(function (c) { return c.tier === "primitive"; }).map(function (c) { return c.name; });
+    if (!primCols.length) {
+      model.collections.unshift({ name: "Primitives", figmaId: null, tier: "primitive", modes: [{ name: "Value", figmaId: null, selector: null }] });
+      primCols = ["Primitives"]; tiers.Primitives = "primitive";
+      log.push({ op: "add-collection", collection: "Primitives" });
+    }
+    var primCol = primCols[0], cols = colByName(model), pmode = cols[primCol].modes[0].name;
+    var lookup = new Map();
+    model.tokens.forEach(function (t) {
+      if (tiers[t.collection] !== "primitive") return;
+      var v = t.values[cols[t.collection].modes[0].name] || {};
+      if (!has(v, "value")) return;
+      var k = t.type + "\u0000" + valueKey(t.type, v.value), prev = lookup.get(k);
+      if (!prev || lessName(t, prev)) lookup.set(k, t);
+    });
+    var res = new Resolver(model), aliasLookup = new Map();
+    model.tokens.forEach(function (t) {
+      var c = res.cols[t.collection];
+      if (tiers[t.collection] === "alias" && c.modes.length === 1) {
+        var r = res.resolve(t.key, c.modes[0].name);
+        if (r.error === null && r.chain.length > 1) {
+          var k = t.type + "\u0000" + valueKey(t.type, r.value), prev = aliasLookup.get(k);
+          if (!prev || lessName(t, prev)) aliasLookup.set(k, t);
+        }
+      }
+    });
+    var ac = model.collections.filter(function (c) { return c.tier === "alias" && c.modes.length === 1; })[0];
+    var aliasCol = ac ? ac.name : null;
+    var mirrorAlias = function (p) {
+      if (!aliasCol || !isDigits(lastSeg(p.name))) return null;
+      var ramp = parentOf(p.name), prefixes = new Map();
+      model.tokens.forEach(function (t) {
+        if (t.collection !== aliasCol || !isDigits(lastSeg(t.name))) return;
+        var tgt = res.idx[firstVal(t).alias];
+        if (tgt && parentOf(tgt.name) === ramp) inc(prefixes, parentOf(t.name));
+      });
+      if (!prefixes.size) return null;
+      var name = mostCommon(prefixes) + "/" + lastSeg(p.name);
+      if (model.tokens.some(function (t) { return t.collection === aliasCol && t.name === name; })) return null;
+      var a = { key: "new:" + aliasCol + "::" + name, name: name, collection: aliasCol, figmaId: null, type: p.type, scopes: null, description: "",
+        codeSyntax: {}, cssVar: cssVarFor(name), values: {}, status: "new" };
+      a.values[colByName(model)[aliasCol].modes[0].name] = { alias: p.key };
+      model.tokens.push(a); res.idx[a.key] = a;
+      log.push({ op: "add-alias", token: refOf(a), to: refOf(p) });
+      return a;
+    };
+    model.tokens.slice().forEach(function (t) {
+      if (tiers[t.collection] === "primitive" || !types.has(t.type)) return;
+      var upper = tiers[t.collection] === "mapped" || tiers[t.collection] === "responsive";
+      Object.keys(t.values).forEach(function (m) {
+        var v = t.values[m];
+        if (!has(v, "value")) return;
+        if (t.type === "STRING" && (!/font|family|typeface/i.test(t.name) || String(v.value).indexOf("(") >= 0)) return;
+        var k = t.type + "\u0000" + valueKey(t.type, v.value);
+        if (upper && aliasLookup.has(k)) {
+          t.values[m] = { alias: aliasLookup.get(k).key }; setDefault(t, "status", "changed");
+          log.push({ op: "literal-to-alias", token: refOf(t), mode: m, to: refOf(aliasLookup.get(k)) });
+          return;
+        }
+        var p = lookup.get(k);
+        if (!p) {
+          var name = newPrimitiveName(model, primCol, t.type, v.value, t);
+          p = { key: "new:" + primCol + "::" + name, name: name, collection: primCol, figmaId: null, type: t.type, scopes: null, description: "",
+            codeSyntax: {}, cssVar: cssVarFor(name), values: {}, status: "new" };
+          p.values[pmode] = { value: v.value };
+          model.tokens.push(p); res.idx[p.key] = p; lookup.set(k, p);
+          log.push({ op: "add-primitive", token: refOf(p), value: v.value, "for": refOf(t) });
+          if (upper && t.type === "COLOR") { var a = mirrorAlias(p); if (a) aliasLookup.set(k, a); }
+        }
+        if (upper && aliasLookup.has(k)) p = aliasLookup.get(k);
+        t.values[m] = { alias: p.key }; setDefault(t, "status", "changed");
+        log.push({ op: "literal-to-alias", token: refOf(t), mode: m, to: refOf(p) });
+      });
+    });
+  }
+
+  var SCOPE_BY_ROLE = { bg: ["FRAME_FILL", "SHAPE_FILL"], text: ["TEXT_FILL"], icon: ["SHAPE_FILL", "STROKE_COLOR"], border: ["STROKE_COLOR"], focus: ["STROKE_COLOR", "EFFECT_COLOR"] };
+  var SCOPE_BY_KIND = { spacing: ["GAP"], radius: ["CORNER_RADIUS"], "font-size": ["FONT_SIZE"], "line-height": ["LINE_HEIGHT"], "font-weight": ["FONT_WEIGHT"],
+    "letter-spacing": ["LETTER_SPACING"], "border-width": ["STROKE_FLOAT"], opacity: ["OPACITY"], size: ["WIDTH_HEIGHT"] };
+  function sameArr(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+  function inferScopes(model, log) {
+    var tiers = tiersOf(model);
+    model.tokens.forEach(function (t) {
+      if (!(t.scopes === null || t.scopes === undefined || sameArr(t.scopes, ["ALL_SCOPES"]))) return;
+      var s;
+      if (tiers[t.collection] === "primitive") s = [];
+      else if (t.type === "COLOR") s = SCOPE_BY_ROLE[roleOf(t.name)] || ["ALL_FILLS", "STROKE_COLOR"];
+      else if (t.type === "FLOAT") s = SCOPE_BY_KIND[floatKind(t.name)] || ["ALL_SCOPES"];
+      else if (/font|family/i.test(t.name)) s = ["FONT_FAMILY"];
+      else return;
+      if (!sameArr(s, t.scopes)) { t.scopes = s; setDefault(t, "status", "changed"); log.push({ op: "scopes", token: refOf(t), scopes: s }); }
+    });
+  }
+
+  function modeSelector(col, i, mode, overrides) {
+    var key = col.name + ":" + mode.name;
+    if (has(overrides, key)) return overrides[key];
+    if (mode.selector) return mode.selector;
+    var n = mode.name.toLowerCase(), ms = slug(mode.name);
+    var themey = /dark|light|dim|contrast|night|day|\bhc\b/.test(n);
+    if (i === 0) return themey ? ':root, [data-theme="' + ms + '"]' : ":root";
+    if (themey) return '[data-theme="' + ms + '"]';
+    if (/mobile|phone|small|compact|\bsm\b|\bs\b/.test(n)) return "@media (max-width: 767px) { :root }";
+    if (/tablet|medium|\bmd\b|\bm\b/.test(n)) return "@media (min-width: 768px) and (max-width: 1023px) { :root }";
+    if (/desktop|large|wide|\blg\b|\bl\b|xl/.test(n)) return "@media (min-width: 1024px) { :root }";
+    return "[data-" + slug(col.name) + '="' + ms + '"]';
+  }
+  function fmtValue(t, v) {
+    if (t.type === "COLOR") return toHex(parseColor(v));
+    if (t.type === "FLOAT") {
+      var kind = floatKind(t.name), f = Number(v);
+      var num = f === Math.trunc(f) ? Math.trunc(f) : pyRound(f, 4);
+      if (UNITLESS.has(kind)) return String(num);
+      if (kind === "duration") return num >= 10 ? num + "ms" : num + "s";
+      return num !== 0 ? num + "px" : "0";
+    }
+    if (t.type === "BOOLEAN") return v ? "1" : "0";
+    var s = String(v);
+    if (/font|family/i.test(t.name) && s.indexOf(" ") >= 0 && !/[,'"]/.test(s)) return '"' + s + '"';
+    return s;
+  }
+  function stripChars(s, chars) {
+    var a = 0, b = s.length;
+    while (a < b && chars.indexOf(s[a]) >= 0) a++;
+    while (b > a && chars.indexOf(s[b - 1]) >= 0) b--;
+    return s.slice(a, b);
+  }
+  function buildManifestAndCss(model, overrides, srcLabel) {
+    var idx = tokIndex(model);
+    var order = model.collections.slice().sort(function (a, b) { return (TIER_ORDER[a.tier] === undefined ? 1 : TIER_ORDER[a.tier]) - (TIER_ORDER[b.tier] === undefined ? 1 : TIER_ORDER[b.tier]); });
+    var man = { format: "token-foundry/manifest@1", generator: "tokenkit " + VERSION, generatedAt: new Date().toISOString().slice(0, 19),
+      source: model.source, css: "tokens.css", collections: [], tokens: [] };
+    var css = ["/*", " * Design tokens. Generated by token-foundry (tokenkit " + VERSION + ") from " + srcLabel + ".",
+      " * Regenerate instead of editing by hand. Figma IDs, scopes and descriptions: tokens.manifest.json", " */", ""];
+    order.forEach(function (col) {
+      var modes = col.modes.map(function (m, i) { return { name: m.name, figmaId: m.figmaId || null, selector: modeSelector(col, i, m, overrides) }; });
+      man.collections.push({ name: col.name, figmaId: col.figmaId || null, tier: col.tier, modes: modes });
+      var ctoks = model.tokens.filter(function (t) { return t.collection === col.name; });
+      modes.forEach(function (m, i) {
+        var lines = [];
+        ctoks.forEach(function (t) {
+          var v = t.values[m.name];
+          if (v === undefined) return;
+          if (has(v, "alias")) { var tg = idx[v.alias]; if (tg) lines.push("  " + t.cssVar + ": var(" + tg.cssVar + ");"); }
+          else lines.push("  " + t.cssVar + ": " + fmtValue(t, v.value) + ";");
+        });
+        if (!lines.length) return;
+        css.push("/* @collection " + col.name + " @tier " + col.tier + " @mode " + m.name + (i === 0 ? " (default)" : "") + " */");
+        var mm = /^(@media[^{]+)\{\s*([\s\S]+?)\s*\}?$/.exec(m.selector);
+        if (mm) css.push(mm[1].trim() + " {\n  " + (stripChars(mm[2], " }") || ":root") + " {\n" + lines.map(function (x) { return "  " + x; }).join("\n") + "\n  }\n}\n");
+        else css.push(m.selector + " {\n" + lines.join("\n") + "\n}\n");
+      });
+    });
+    model.tokens.forEach(function (t) {
+      var vals = {};
+      Object.keys(t.values).forEach(function (m) {
+        var v = t.values[m];
+        if (has(v, "alias")) {
+          var tg = idx[v.alias];
+          vals[m] = tg ? { alias: { collection: tg.collection, name: tg.name, cssVar: tg.cssVar, figmaId: tg.figmaId || null } } : { alias: { figmaId: v.alias, external: true } };
+        } else vals[m] = { value: v.value };
+      });
+      man.tokens.push({ cssVar: t.cssVar, name: t.name, collection: t.collection, figmaId: t.figmaId || null, type: t.type,
+        scopes: t.scopes === undefined ? null : t.scopes, description: t.description || "", codeSyntax: t.codeSyntax || {}, status: t.status || "unchanged", values: vals });
+    });
+    return [man, css.join("\n")];
+  }
+
+  // opts: { changes:[], colorsOnly, keepLiterals, inferScopes, noCodeSyntax, modeSelectors:{ "Col:Mode": sel } }
+  function generate(model, opts) {
+    opts = opts || {};
+    model = clone(model);
+    var log = [];
+    if (opts.changes && opts.changes.length) applyChanges(model, opts.changes, log);
+    if (!opts.keepLiterals) enforcePrimitives(model, log, new Set(opts.colorsOnly ? ["COLOR"] : ["COLOR", "FLOAT", "STRING"]));
+    if (opts.inferScopes) inferScopes(model, log);
+    var seen = {};
+    model.tokens.forEach(function (t) {
+      t.cssVar = t.cssVar || cssVarFor(t.name);
+      if (has(seen, t.cssVar)) {
+        var nv = "--" + slug(t.collection) + "-" + t.cssVar.slice(2);
+        log.push({ op: "css-rename", token: refOf(t), from: t.cssVar, to: nv });
+        t.cssVar = nv;
+      }
+      seen[t.cssVar] = t;
+    });
+    if (!opts.noCodeSyntax) model.tokens.forEach(function (t) {
+      var want = "var(" + t.cssVar + ")";
+      if ((t.codeSyntax || {}).WEB !== want) t.codeSyntax = Object.assign({}, t.codeSyntax || {}, { WEB: want });
+    });
+    var r = buildManifestAndCss(model, opts.modeSelectors || {}, model.source.kind + " " + (model.source.file || ""));
+    r[0].changes = log;
+    r[0].css = opts.cssName || "tokens.css";
+    return { manifest: r[0], css: r[1], log: log, model: model };
+  }
+
+  // ---------------------------------------------------------------- reports
+  var SEV = ["error", "warning", "info"];
+  function renderAuditMd(o) {
+    var s = o.summary;
+    var L = ["# Token audit (full findings)", "",
+      "Source: " + s.source.kind + " `" + (s.source.file || s.source.fileName || "") + "`  |  Tokens: " + s.counts.tokens + " in " + s.counts.collections + " collections  |  Generated " + s.generatedAt, "",
+      "| Score | Value |", "|---|---|"];
+    Object.keys(s.scores).forEach(function (k) { var v = s.scores[k]; L.push("| " + k + " | " + (v === null ? "n/a" : v + "/100") + " |"); });
+    L.push("", "Collections: " + Object.keys(s.counts.byTier).map(function (n) { return n + " (" + s.counts.byTier[n] + "; " + s.counts.modes[n].join("/") + ")"; }).join(", "), "");
+    [["structure", "Structure"], ["accessibility", "Accessibility (WCAG 2.2 AA)"], ["ai", "AI-readiness"]].forEach(function (a) {
+      var fs = o.findings.filter(function (f) { return f.area === a[0]; });
+      L.push("## " + a[1], "");
+      if (!fs.length) L.push("No findings.", "");
+      fs.slice().sort(function (x, y) { return SEV.indexOf(x.severity) - SEV.indexOf(y.severity); }).forEach(function (f) {
+        L.push("- **[" + f.severity + "] " + f.id + " " + f.title + "** (" + f.count + ")" + (f.fix === "auto" ? " - auto-fixable" : ""));
+        if (f.detail) L.push("  - " + f.detail);
+        if (f.tokens.length) L.push("  - " + f.tokens.slice(0, 15).map(function (x) { return "`" + x + "`"; }).join(", ") + (f.count > 15 ? " ..." : ""));
+      });
+      L.push("");
+    });
+    L.push("## AI-readiness criteria", "", "| Criterion | Weight | Score |", "|---|---|---|");
+    o.ai.criteria.forEach(function (c) { L.push("| " + c.id + " " + c.name + " | " + c.weight + " | " + c.score + " |"); });
+    if (o.suggestions && o.suggestions.length) {
+      L.push("", "## Contrast fix proposals", "", "| Token | Mode | Current | Worst pair | Nearest passing step | Minimal shift |", "|---|---|---|---|---|---|");
+      o.suggestions.forEach(function (x) {
+        L.push("| " + x.token + " | " + x.mode + " | `" + x.current + "` | " + x.worst + " | " + (x.nearestStep ? x.nearestStep + " `" + x.nearestStepHex + "`" : "none") + " | " + (x.minimalShift ? "`" + x.minimalShift + "`" : "none") + " |");
+      });
+    }
+    var fails = o.contrast.filter(function (c) { return !c.pass; });
+    L.push("", "## Contrast failures (" + fails.length + " of " + o.contrast.length + " checks)", "", "| Foreground | Background | Mode | Ratio | Min | Kind | APCA Lc (WCAG 3 draft, informative) |", "|---|---|---|---|---|---|---|");
+    fails.slice().sort(function (a, b) { return a.ratio - b.ratio; }).slice(0, 80).forEach(function (c) {
+      L.push("| " + c.fg + " `" + c.fgHex + "` | " + c.bg + " `" + c.bgHex + "` | " + c.mode + " | " + c.ratio.toFixed(2) + " | " + c.min.toFixed(1) + " | " + c.kind + " | " + c.apca.toFixed(1) + " |");
+    });
+    return L.join("\n") + "\n";
+  }
+
+  // One-page report. `after` and `log` are optional.
+  function renderReport(before, after, log) {
+    var s = before.summary, sc = s.scores, a = after ? after.summary.scores : null;
+    var f = function (v) { return v === null || v === undefined ? "n/a" : v + "/100"; };
+    var name = s.source.fileName || s.source.file || "tokens";
+    var L = ["# Token audit · " + name + " · " + s.generatedAt.slice(0, 10), "",
+      s.counts.tokens + " tokens · " + s.counts.collections + " collections (" + Object.keys(s.counts.byTier).map(function (n) { return n + ": " + s.counts.byTier[n]; }).join(", ") + ")", "",
+      a ? "| | Before | After |" : "| | Score |", a ? "|---|---|---|" : "|---|---|"];
+    [["Structure", "structure"], ["Accessibility (WCAG 2.2 AA)", "accessibility"], ["AI-ready", "aiReady"]].forEach(function (r) {
+      var extra = r[1] === "accessibility" ? " · " + s.contrastChecks.failed + "/" + s.contrastChecks.total + " pairs fail" : "";
+      L.push("| " + r[0] + " | " + f(sc[r[1]]) + extra + (a ? " | " + f(a[r[1]]) : "") + " |");
+    });
+    var top = before.findings.filter(function (x) { return x.severity !== "info"; })
+      .sort(function (x, y) { return SEV.indexOf(x.severity) - SEV.indexOf(y.severity); }).slice(0, 8);
+    L.push("", "## Top findings");
+    if (!top.length) L.push("No errors or warnings.");
+    top.forEach(function (x, i) {
+      L.push((i + 1) + ". **" + x.severity + " · " + x.title + "** (" + x.count + "). " + (EXPLAIN[x.id] || x.detail || "") + (x.fix === "auto" ? " Fixed automatically in the generated tokens." : ""));
+    });
+    if (log && log.length) {
+      var counts = {};
+      log.forEach(function (c) { counts[c.op] = (counts[c.op] || 0) + 1; });
+      var prims = log.filter(function (c) { return c.op === "add-primitive"; }).map(function (c) { return "`" + c.token.split("::")[1] + "`"; });
+      L.push("", "## Changes applied");
+      Object.keys(counts).forEach(function (k) { L.push("- " + (OPLABEL[k] || k) + ": " + counts[k]); });
+      if (prims.length) L.push("- New primitives: " + prims.slice(0, 12).join(", ") + (prims.length > 12 ? " …" : ""));
+    }
+    var open = (after || before).findings.filter(function (x) { return x.fix !== "auto" && x.severity !== "info"; }).map(function (x) { return "- " + x.title + (x.count ? " (" + x.count + ")" : ""); });
+    if (open.length) L.push("", "## Needs a decision", open.slice(0, 8).join("\n"));
+    L.push("", "Files: tokens.css · tokens.manifest.json (Figma IDs) · audit.md (full findings)");
+    return L.join("\n") + "\n";
+  }
+
+  var EXPLAIN = {
+    S1: "Without a primitive layer every theme change must be made token by token.",
+    S1b: "Components would bind to raw palette values, so roles like surface or text are missing.",
+    S2: "Semantic tokens should point at a primitive so a palette change propagates everywhere.",
+    S3: "A lower tier points at a higher tier; theming breaks when modes switch.",
+    S4: "The alias points at a variable that no longer exists.",
+    S4b: "Aliases point at each other in a loop and never resolve.",
+    S5: "Some modes have no value, so the token renders empty in that mode.",
+    S6a: "Uppercase letters make names inconsistent with code.",
+    S6b: "Spaces break the mapping to CSS names.",
+    S6c: "Mixing kebab, snake and camel case makes names unpredictable.",
+    S6d: "Two tokens end up with the same CSS name.",
+    S7b: "The ramp does not get steadily lighter or darker.",
+    S8: "The same color exists under several names.",
+    S10: "Long alias chains are hard to trace.",
+    A1: "Text or icons on their own surface do not reach WCAG AA.",
+    A2: "Text on neutral surfaces is below 4.5:1 (WCAG 1.4.3).",
+    A2b: "Inverse text is below AA on inverse surfaces.",
+    A3: "Icons are below 3:1 (WCAG 1.4.11).",
+    A4: "The focus indicator is below 3:1 against surfaces (WCAG 1.4.11).",
+    A4b: "No focus color token exists, so focus visibility cannot be tested.",
+    A5: "Input and control borders are below 3:1 (WCAG 1.4.11).",
+    A7: "Colored surfaces have no matching text color, so contrast is left to chance.",
+    A8: "Two states use the same color in every mode, so users cannot tell them apart.",
+    A11: "Targets smaller than 24px fail WCAG 2.5.8.",
+    A12: "These pairs pass WCAG 2.2 but have low APCA contrast. WCAG 3 is still a draft; treat this as an early warning.",
+  };
+  var OPLABEL = { "literal-to-alias": "Raw values turned into aliases", "add-primitive": "Primitives created", "add-alias": "Alias tokens created",
+    alias: "Tokens re-pointed", set: "Values changed", rename: "Tokens renamed", add: "Tokens added", describe: "Descriptions set",
+    scopes: "Scopes set", "css-rename": "CSS names de-duplicated", "add-collection": "Collections created" };
+
+  return {
+    VERSION: VERSION, ingestFigma: ingestFigma, ingestCss: ingestCss, ingestManifest: ingestManifest, audit: audit, generate: generate,
+    renderAuditMd: renderAuditMd, renderReport: renderReport, EXPLAIN: EXPLAIN, OPLABEL: OPLABEL,
+    parseColor: parseColor, apcaLc: apcaLc, toHex: toHex, contrast: contrast, inferTiers: inferTiers, Resolver: Resolver, refOf: refOf,
+  };
+})();
+if (typeof module !== "undefined" && module.exports) module.exports = TK;

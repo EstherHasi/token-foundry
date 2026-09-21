@@ -1,0 +1,19 @@
+{
+  "name": "token-foundry",
+  "version": "0.2.0",
+  "description": "Audit any design-token set (CSS or Figma variables) for structure, WCAG 2.2 AA contrast and AI-readiness, write a one-page report, and generate a clean tokens.css plus a manifest with Figma IDs that can be pushed back to Figma.",
+  "author": {
+    "name": "Esther SJ Diez"
+  },
+  "keywords": [
+    "design-tokens",
+    "figma-variables",
+    "design-system",
+    "accessibility",
+    "wcag",
+    "css"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/EstherHasi/token-foundry",
+  "repository": "https://github.com/EstherHasi/token-foundry"
+}

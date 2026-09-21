@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.DS_Store
+out/
+work/
+token-audit-*/
+*.plugin
+dist/
+node_modules/

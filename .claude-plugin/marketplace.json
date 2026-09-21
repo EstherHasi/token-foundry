@@ -1,0 +1,17 @@
+{
+  "name": "token-foundry",
+  "owner": {
+    "name": "Esther SJ Diez"
+  },
+  "metadata": {
+    "description": "Design-token audit and generation tools for any design system."
+  },
+  "plugins": [
+    {
+      "name": "token-foundry",
+      "source": "./",
+      "description": "Audit design tokens (structure, WCAG 2.2 AA, AI-readiness), generate clean tokens.css + Figma-ID manifest, push to Figma.",
+      "version": "0.2.0"
+    }
+  ]
+}

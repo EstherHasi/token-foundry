@@ -1,0 +1,394 @@
+<!-- Source of ui.html. Build with: bash build.sh (inlines engine.js). -->
+<style>
+  :root {
+    --bg: var(--figma-color-bg, #fff);
+    --bg2: var(--figma-color-bg-secondary, #f5f5f5);
+    --bg3: var(--figma-color-bg-tertiary, #ebebeb);
+    --fg: var(--figma-color-text, #1e1e1e);
+    --muted: var(--figma-color-text-secondary, #666);
+    --border: var(--figma-color-border, #e3e3e3);
+    --brand: var(--figma-color-bg-brand, #0d99ff);
+    --on-brand: var(--figma-color-text-onbrand, #fff);
+    --err: var(--figma-color-text-danger, #d32f2f);
+    --warn: var(--figma-color-text-warning, #b26a00);
+    --ok: var(--figma-color-text-success, #14804a);
+    --info: var(--figma-color-text-secondary, #666);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { font: 12px/1.45 Inter, system-ui, sans-serif; color: var(--fg); background: var(--bg); display: flex; flex-direction: column; }
+  header { padding: 10px 12px 0; border-bottom: 1px solid var(--border); }
+  .top { display: flex; align-items: center; gap: 8px; }
+  .top h1 { font-size: 13px; margin: 0; flex: 1; }
+  .status { color: var(--muted); font-size: 11px; margin: 4px 0 8px; min-height: 16px; }
+  nav { display: flex; gap: 2px; }
+  nav button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 8px; color: var(--muted); }
+  nav button[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--brand); font-weight: 600; }
+  main { flex: 1; overflow: auto; padding: 12px; }
+  section[hidden] { display: none; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+  h2:first-child { margin-top: 0; }
+  p { margin: 0 0 8px; }
+  .muted { color: var(--muted); }
+  button { font: inherit; padding: 6px 12px; border-radius: 5px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--brand); color: var(--on-brand); border-color: transparent; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button:focus-visible, select:focus-visible, input:focus-visible, summary:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .card { border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+  .card .k { color: var(--muted); font-size: 11px; }
+  .card .v { font-size: 22px; font-weight: 600; margin: 2px 0; }
+  .card .d { font-size: 11px; color: var(--muted); }
+  .bar { height: 4px; border-radius: 2px; background: var(--bg3); overflow: hidden; margin-top: 4px; }
+  .bar i { display: block; height: 100%; background: var(--brand); }
+  .delta { font-size: 11px; font-weight: 600; }
+  .up { color: var(--ok); } .down { color: var(--err); }
+  table { width: 100%; border-collapse: collapse; font-size: inherit; }
+  select, input, button, td, th { font-size: 12px; }
+  th, td { text-align: left; padding: 5px 4px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; }
+  select { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px; }
+  .f { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 6px; }
+  .f .t { display: flex; gap: 6px; align-items: baseline; }
+  .f .t b { flex: 1; }
+  .sev { font-size: 10px; font-weight: 600; text-transform: uppercase; padding: 1px 5px; border-radius: 3px; border: 1px solid currentColor; }
+  .sev.error { color: var(--err); } .sev.warning { color: var(--warn); } .sev.info { color: var(--info); }
+  .tag { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--bg2); color: var(--muted); }
+  details summary { cursor: pointer; color: var(--muted); margin-top: 4px; }
+  code, .mono { font: 11px/1.4 ui-monospace, Menlo, monospace; }
+  .toks { max-height: 140px; overflow: auto; margin-top: 4px; }
+  .toks code { display: inline-block; background: var(--bg2); border-radius: 3px; padding: 0 4px; margin: 1px 2px 1px 0; }
+  .sw { display: inline-flex; align-items: center; justify-content: center; width: 38px; height: 24px; border-radius: 4px; border: 1px solid var(--border); font-weight: 600; font-size: 12px; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 3px; border: 1px solid var(--border); vertical-align: -2px; margin-right: 3px; }
+  .pass { color: var(--ok); font-weight: 600; } .fail { color: var(--err); font-weight: 600; }
+  .fix { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+  .fix label { display: flex; gap: 6px; align-items: center; margin: 3px 0; }
+  .chk label { display: flex; gap: 6px; align-items: flex-start; margin: 5px 0; }
+  .note { background: var(--bg2); border-radius: 6px; padding: 8px 10px; margin: 8px 0; }
+  pre { white-space: pre-wrap; margin: 0; }
+  .empty { text-align: center; color: var(--muted); padding: 40px 10px; }
+</style>
+
+<header>
+  <div class="top">
+    <h1>Token Foundry</h1>
+    <button id="scan" class="primary">Scan variables</button>
+  </div>
+  <div class="status" id="status" role="status" aria-live="polite">Reading local variables…</div>
+  <nav role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+    <button role="tab" data-tab="findings">Findings</button>
+    <button role="tab" data-tab="contrast">Contrast</button>
+    <button role="tab" data-tab="fix">Fix &amp; apply</button>
+    <button role="tab" data-tab="export">Export</button>
+  </nav>
+</header>
+
+<main>
+  <section id="tab-overview"><div class="empty">Scanning…</div></section>
+  <section id="tab-findings" hidden></section>
+  <section id="tab-contrast" hidden></section>
+  <section id="tab-fix" hidden></section>
+  <section id="tab-export" hidden>
+    <h2>Download</h2>
+    <p class="muted">Files reflect the last preview. Without a preview, the automatic fixes are used.</p>
+    <div class="row">
+      <button data-dl="report">Report (.md)</button>
+      <button data-dl="audit-md">Full audit (.md)</button>
+      <button data-dl="css">tokens.css</button>
+      <button data-dl="manifest">tokens.manifest.json</button>
+    </div>
+    <div class="row">
+      <button data-dl="export">Variables export (.json)</button>
+      <button data-dl="audit-json">audit.json</button>
+    </div>
+    <h2>Audit another source</h2>
+    <p class="muted">Load a CSS file with custom properties, a Figma variables export or a tokens.manifest.json. Applying writes it into this file's variables.</p>
+    <input type="file" id="importFile" accept=".css,.json,text/css,application/json" aria-label="Source file">
+    <div class="row"><button id="backToFile">Back to this file's variables</button></div>
+  </section>
+</main>
+
+<script>
+/*__ENGINE__*/
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (s) { return String(s === null || s === undefined ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); };
+  var S = { exportData: null, model: null, audit: null, baseline: null, gen: null, projected: null, dry: null, source: "figma", fileLabel: "", choices: {}, onlyFails: true, sev: "all" };
+  var post = function (msg) { parent.postMessage({ pluginMessage: msg }, "*"); };
+  var status = function (t) { $("status").textContent = t; };
+
+  // ---------- tabs
+  document.querySelectorAll("nav button").forEach(function (b) {
+    b.onclick = function () { showTab(b.dataset.tab); };
+  });
+  function showTab(name) {
+    document.querySelectorAll("nav button").forEach(function (b) { b.setAttribute("aria-selected", String(b.dataset.tab === name)); });
+    document.querySelectorAll("main section").forEach(function (s) { s.hidden = s.id !== "tab-" + name; });
+    document.querySelector("main").scrollTop = 0;
+  }
+
+  // ---------- scan / audit
+  $("scan").onclick = function () { S.source = "figma"; status("Reading local variables…"); post({ type: "scan" }); };
+  function loadModel(model, label) {
+    S.model = model; S.fileLabel = label; S.gen = null; S.dry = null; S.projected = null; S.choices = {};
+    runAudit();
+  }
+  function runAudit() {
+    try {
+      S.audit = TK.audit(S.model);
+      if (!S.baseline || S.baseline.label !== S.fileLabel) S.baseline = { label: S.fileLabel, audit: S.audit };
+      var s = S.audit.summary.counts;
+      status(S.fileLabel + " · " + s.tokens + " variables in " + s.collections + " collections · audited " + new Date().toLocaleTimeString());
+      renderAll();
+    } catch (e) { status("Audit failed: " + e.message); }
+  }
+
+  // ---------- render
+  function renderAll() { renderOverview(); renderFindings(); renderContrast(); renderFix(); }
+
+  function scoreCard(label, key, desc) {
+    var v = S.audit.summary.scores[key], b = S.baseline.audit.summary.scores[key], p = S.projected ? S.projected.summary.scores[key] : null;
+    var delta = "";
+    if (S.baseline.audit !== S.audit && b !== null && v !== null && b !== v) delta = '<span class="delta ' + (v > b ? "up" : "down") + '">' + (v > b ? "+" : "") + (v - b) + " since first scan</span>";
+    else if (p !== null && p !== undefined && v !== null && p !== v) delta = '<span class="delta ' + (p > v ? "up" : "down") + '">→ ' + p + " after preview</span>";
+    return '<div class="card"><div class="k">' + label + '</div><div class="v">' + (v === null ? "n/a" : v) + '<span class="muted" style="font-size:12px">/100</span></div>' +
+      '<div class="bar"><i style="width:' + (v || 0) + '%"></i></div><div class="d">' + desc + "</div>" + delta + "</div>";
+  }
+  function renderOverview() {
+    var a = S.audit, s = a.summary, cc = s.contrastChecks;
+    var h = '<div class="cards">' +
+      scoreCard("Structure", "structure", "Layers, references, naming") +
+      scoreCard("Accessibility", "accessibility", "WCAG 2.2 AA · " + cc.failed + " of " + cc.total + " pairs fail") +
+      scoreCard("AI-ready", "aiReady", "Names, descriptions, scopes, pairs") + "</div>";
+    h += '<h2>Collections</h2><p class="muted">Tier is inferred. Change it if it is wrong; the audit reruns.</p><table><tr><th>Collection</th><th>Tier</th><th>Modes</th><th>Variables</th></tr>';
+    S.model.collections.forEach(function (c, i) {
+      var n = S.model.tokens.filter(function (t) { return t.collection === c.name; }).length;
+      h += "<tr><td>" + esc(c.name) + '</td><td><select data-tier="' + i + '" aria-label="Tier of ' + esc(c.name) + '">' +
+        ["primitive", "alias", "mapped", "responsive"].map(function (t) { return "<option" + (t === c.tier ? " selected" : "") + ">" + t + "</option>"; }).join("") +
+        "</select></td><td>" + c.modes.map(function (m) { return esc(m.name); }).join(", ") + "</td><td>" + n + "</td></tr>";
+    });
+    h += "</table>";
+    var top = a.findings.filter(function (f) { return f.severity !== "info"; }).sort(function (x, y) { return ["error", "warning"].indexOf(x.severity) - ["error", "warning"].indexOf(y.severity); }).slice(0, 5);
+    h += "<h2>Top issues</h2>";
+    if (!top.length) h += '<p class="muted">No errors or warnings.</p>';
+    top.forEach(function (f) { h += findingCard(f, false); });
+    h += '<div class="note">WCAG 2.2 AA is the scored standard. WCAG 3.0 is a W3C Working Draft whose contrast method is not final; the APCA values in the Contrast tab are an informative preview.</div>';
+    $("tab-overview").innerHTML = h;
+    document.querySelectorAll("[data-tier]").forEach(function (sel) {
+      sel.onchange = function () { S.model.collections[Number(sel.dataset.tier)].tier = sel.value; S.gen = null; S.dry = null; S.projected = null; runAudit(); };
+    });
+  }
+  function findingCard(f, full) {
+    var ex = TK.EXPLAIN[f.id] || "";
+    var h = '<div class="f"><div class="t"><span class="sev ' + f.severity + '">' + f.severity + "</span><b>" + esc(f.title) + "</b>" +
+      (f.fix === "auto" ? '<span class="tag">auto-fix</span>' : "") + (f.count ? '<span class="muted">' + f.count + "</span>" : "") + "</div>";
+    if (ex) h += "<p>" + esc(ex) + "</p>";
+    if (full && f.detail) h += '<p class="muted">' + esc(f.detail) + "</p>";
+    if (full && f.tokens.length) h += "<details><summary>" + f.count + " affected</summary><div class=\"toks\">" + f.tokens.map(function (t) { return "<code>" + esc(t) + "</code>"; }).join("") + (f.count > f.tokens.length ? " …" : "") + "</div></details>";
+    return h + "</div>";
+  }
+  function renderFindings() {
+    var fs = S.audit.findings;
+    var h = '<div class="row" role="group" aria-label="Filter by severity">' + ["all", "error", "warning", "info"].map(function (k) {
+      var n = k === "all" ? fs.length : fs.filter(function (f) { return f.severity === k; }).length;
+      return '<button data-sev="' + k + '"' + (S.sev === k ? ' class="primary"' : "") + ">" + k + " (" + n + ")</button>";
+    }).join("") + "</div>";
+    [["structure", "Structure"], ["accessibility", "Accessibility"], ["ai", "AI-readiness"]].forEach(function (a) {
+      var list = fs.filter(function (f) { return f.area === a[0] && (S.sev === "all" || f.severity === S.sev); });
+      if (!list.length) return;
+      h += "<h2>" + a[1] + "</h2>";
+      list.sort(function (x, y) { return ["error", "warning", "info"].indexOf(x.severity) - ["error", "warning", "info"].indexOf(y.severity); })
+        .forEach(function (f) { h += findingCard(f, true); });
+    });
+    h += "<h2>AI-readiness criteria</h2><table><tr><th>Criterion</th><th>Weight</th><th>Score</th></tr>" + S.audit.ai.criteria.map(function (c) {
+      return "<tr><td>" + esc(c.name) + '<div class="muted">' + esc(c.why) + "</div></td><td>" + c.weight + "</td><td>" + Math.round(c.score) + "</td></tr>";
+    }).join("") + "</table>";
+    $("tab-findings").innerHTML = h;
+    document.querySelectorAll("[data-sev]").forEach(function (b) { b.onclick = function () { S.sev = b.dataset.sev; renderFindings(); }; });
+  }
+  function renderContrast() {
+    var all = S.audit.contrast, rows = all.filter(function (c) { return !S.onlyFails || !c.pass; }).sort(function (a, b) { return a.ratio - b.ratio; });
+    var h = '<div class="row"><label><input type="checkbox" id="onlyFails"' + (S.onlyFails ? " checked" : "") + "> Only failures</label><span class=\"muted\">" + all.length + " pairs tested</span></div>";
+    if (!rows.length) h += '<p class="muted">' + (all.length ? "All tested pairs pass WCAG 2.2 AA." : "No pairs could be inferred. Semantic color tokens with roles (surface, text, border, on-*) are needed.") + "</p>";
+    else {
+      h += "<table><tr><th></th><th>Foreground / background</th><th>Mode</th><th>WCAG 2.2</th><th title=\"WCAG 3 draft, informative\">APCA Lc*</th></tr>";
+      rows.slice(0, 300).forEach(function (c) {
+        h += '<tr><td><span class="sw" style="background:' + c.bgHex + ";color:" + c.fgHex + '">Aa</span></td><td>' + esc(c.fg.split("::")[1]) + '<div class="muted">on ' + esc(c.bg.split("::")[1]) +
+          (c.kind === "border-decorative" ? " · decorative" : "") + "</div></td><td>" + esc(c.mode) + '</td><td><span class="' + (c.pass ? "pass" : "fail") + '">' + c.ratio.toFixed(2) +
+          '</span><div class="muted">min ' + c.min + '</div></td><td class="muted">' + Math.abs(c.apca).toFixed(0) + "<div>min " + c.apcaMin + "</div></td></tr>";
+      });
+      h += "</table>";
+    }
+    h += '<p class="muted">* APCA is the contrast method proposed for WCAG 3.0, still a Working Draft. Shown for reference; not scored.</p>';
+    $("tab-contrast").innerHTML = h;
+    $("onlyFails").onchange = function (e) { S.onlyFails = e.target.checked; renderContrast(); };
+  }
+
+  // ---------- fix & apply
+  function lightness(hex) { var c = TK.parseColor(hex); return (Math.max(c[0], c[1], c[2]) + Math.min(c[0], c[1], c[2])) / 2; }
+  function bigShift(x) { return x.minimalShift && Math.abs(lightness(x.minimalShift) - lightness(x.current)) > 0.35; }
+  function recommended(x) { return x.nearestStep ? "step" : (x.minimalShift && !bigShift(x)) ? "shift" : "keep"; }
+  function renderFix() {
+    var a = S.audit, s2 = a.findings.filter(function (f) { return f.id === "S2"; }).reduce(function (n, f) { return n + f.count; }, 0);
+    var h = "<h2>Automatic</h2><div class=\"chk\">" +
+      '<label><input type="checkbox" id="optLiterals" checked> <span>Move raw values in semantic tokens into primitives <span class="muted">(' + s2 + " tokens). Missing primitives are created in the closest ramp.</span></span></label>" +
+      '<label><input type="checkbox" id="optColorsOnly"> <span>Colors only <span class="muted">(leave spacing and type values as they are)</span></span></label>' +
+      '<label><input type="checkbox" id="optCode" checked> <span>Set CSS code syntax on every variable <span class="muted">(Dev Mode and MCP return <code>var(--name)</code>)</span></span></label>' +
+      '<label><input type="checkbox" id="optScopes"> <span>Set scopes where missing <span class="muted">(primitives hidden from pickers, roles scoped to fills, text or strokes)</span></span></label></div>';
+    h += "<h2>Contrast fixes</h2>";
+    if (!a.suggestions.length) h += '<p class="muted">No failing pairs to fix.</p>';
+    else {
+      h += '<div class="row"><button id="recommend" title="Nearest ramp step, else a small lightness shift. Large shifts are left for you to decide.">Select recommended</button><button id="keepAll">Keep all</button></div>';
+      a.suggestions.forEach(function (x, i) {
+        var id = x.token + "|" + x.mode, cur = S.choices[id] || "keep";
+        h += '<div class="fix"><b>' + esc(x.token.split("::")[1]) + '</b> <span class="muted">' + esc(x.mode) + " · worst " + esc(x.worst.split("::")[1] || x.worst) + "</span>" +
+          '<label><input type="radio" name="fx' + i + '" data-fix="' + esc(id) + '" value="keep"' + (cur === "keep" ? " checked" : "") + '> Keep <span class="dot" style="background:' + x.current + '"></span><code>' + x.current + "</code></label>" +
+          (x.nearestStep ? '<label><input type="radio" name="fx' + i + '" data-fix="' + esc(id) + '" value="step"' + (cur === "step" ? " checked" : "") + '> Use <code>' + esc(x.nearestStep.split("::")[1]) + '</code> <span class="dot" style="background:' + x.nearestStepHex + '"></span><code>' + x.nearestStepHex + "</code></label>" : "") +
+          (x.minimalShift ? '<label><input type="radio" name="fx' + i + '" data-fix="' + esc(id) + '" value="shift"' + (cur === "shift" ? " checked" : "") + '> Shift lightness <span class="dot" style="background:' + x.minimalShift + '"></span><code>' + x.minimalShift + "</code> <span class=\"muted\">(new primitive)</span></label>" : "") +
+          (bigShift(x) && !x.nearestStep ? '<p class="muted">Large change: changing the background is usually the better fix. Not selected by "Select recommended".</p>' : "") +
+          (!x.nearestStep && !x.minimalShift ? '<p class="muted">No foreground fix found. Change the background instead.</p>' : "") + "</div>";
+      });
+    }
+    var open = a.findings.filter(function (f) { return f.fix !== "auto" && f.severity !== "info" && f.area !== "accessibility"; });
+    if (open.length) h += "<h2>Needs a decision outside this plugin</h2>" + open.map(function (f) { return '<p>· ' + esc(f.title) + ' <span class="muted">(' + f.count + ")</span></p>"; }).join("");
+    h += '<h2>Preview and apply</h2><div class="row"><button id="preview" class="primary">Preview changes</button><button id="apply" disabled>Apply to Figma</button></div><div id="dry"></div>';
+    $("tab-fix").innerHTML = h;
+    ["optLiterals", "optColorsOnly", "optCode", "optScopes"].forEach(function (id) { $(id).onchange = invalidate; });
+    document.querySelectorAll("[data-fix]").forEach(function (r) { r.onchange = function () { S.choices[r.dataset.fix] = r.value; invalidate(); }; });
+    if ($("recommend")) $("recommend").onclick = function () {
+      a.suggestions.forEach(function (x) { S.choices[x.token + "|" + x.mode] = recommended(x); });
+      invalidate(); renderFix();
+    };
+    if ($("keepAll")) $("keepAll").onclick = function () { S.choices = {}; invalidate(); renderFix(); };
+    $("preview").onclick = preview;
+    $("apply").onclick = apply;
+    renderDry();
+  }
+  function invalidate() { S.gen = null; S.dry = null; S.projected = null; if ($("apply")) $("apply").disabled = true; if ($("dry")) $("dry").innerHTML = ""; }
+  function currentChanges() {
+    var ch = [];
+    S.audit.suggestions.forEach(function (x) {
+      var c = S.choices[x.token + "|" + x.mode];
+      if (c === "step") ch.push({ op: "alias", token: x.token, mode: x.mode, to: x.nearestStep });
+      if (c === "shift") ch.push({ op: "set", token: x.token, mode: x.mode, value: x.minimalShift });
+    });
+    return ch;
+  }
+  function genOpts() {
+    var g = function (id, d) { return $(id) ? $(id).checked : d; };
+    return { changes: currentChanges(), keepLiterals: !g("optLiterals", true), colorsOnly: g("optColorsOnly", false), noCodeSyntax: !g("optCode", true), inferScopes: g("optScopes", false) };
+  }
+  function ensureGen() {
+    if (!S.gen) S.gen = TK.generate(S.model, genOpts());
+    return S.gen;
+  }
+  function preview() {
+    try {
+      var g = ensureGen();
+      S.projected = TK.audit(g.model);
+      status("Simulating in Figma…");
+      post({ type: "apply", manifest: g.manifest, options: { dryRun: true } });
+    } catch (e) { status("Preview failed: " + e.message); }
+  }
+  function apply() {
+    if (!S.gen || !S.dry) return;
+    status("Applying…");
+    post({ type: "apply", manifest: S.gen.manifest, options: { dryRun: false } });
+  }
+  function renderDry() {
+    var el = $("dry");
+    if (!el || !S.dry) return;
+    var r = S.dry, s = r.summary, g = S.gen;
+    var counts = {};
+    g.log.forEach(function (c) { counts[c.op] = (counts[c.op] || 0) + 1; });
+    var h = '<div class="note"><b>' + (r.dryRun ? "Preview" : "Applied") + ": " + s.totalChanges + " changes in Figma</b><br>" +
+      s.createdCollections + " collections, " + s.createdModes + " modes and " + s.createdVariables + " variables created · " + s.updated + " variables updated · " +
+      s.renamed + " renamed · " + s.unchanged + " unchanged · " + s.leftovers + " not in the result (kept, never deleted)" +
+      (r.safety ? "<br>Safety check: " + r.safety.checked + " variables re-read, " + r.safety.problems.length + " problems" : "") + "</div>";
+    if (S.projected && r.dryRun) {
+      var p = S.projected.summary.scores, c = S.audit.summary.scores;
+      h += "<p>Projected scores: structure " + c.structure + " → <b>" + p.structure + "</b> · accessibility " + c.accessibility + " → <b>" + p.accessibility + "</b> · AI-ready " + c.aiReady + " → <b>" + p.aiReady + "</b></p>";
+    }
+    var ops = Object.keys(counts);
+    if (ops.length) h += "<table><tr><th>Token change</th><th>Count</th></tr>" + ops.map(function (k) { return "<tr><td>" + esc(TK.OPLABEL[k] || k) + "</td><td>" + counts[k] + "</td></tr>"; }).join("") + "</table>";
+    var list = function (title, arr, fmt) {
+      if (!arr || !arr.length) return "";
+      return "<details><summary>" + title + " (" + arr.length + ")</summary><div class=\"toks\">" + arr.map(function (x) { return "<code>" + esc(fmt ? fmt(x) : x) + "</code>"; }).join("") + "</div></details>";
+    };
+    h += list("Errors", r.errors) + list("Warnings", r.warnings) + list("New variables", r.created.variables) +
+      list("Updated variables", r.updated, function (x) { return typeof x === "string" ? x : x.token + (x.modes.length ? " [" + x.modes.join(", ") + "]" : "") + (x.meta.length ? " · " + x.meta.join(", ") : ""); }) +
+      list("Kept, not in result", r.leftovers) + (r.safety ? list("Safety problems", r.safety.problems) : "");
+    el.innerHTML = h;
+    $("apply").disabled = !r.dryRun || r.errors.length > 0 || s.totalChanges === 0;
+  }
+
+  // ---------- messages from code.js
+  onmessage = function (e) {
+    var m = e.data.pluginMessage;
+    if (!m) return;
+    if (m.type === "scan") {
+      S.exportData = m.data;
+      var n = m.data.variables.length;
+      if (!n) { $("tab-overview").innerHTML = '<div class="empty">This file has no local variables.<br>Load a CSS file or manifest in the Export tab to start.</div>'; status("No local variables"); return; }
+      loadModel(TK.ingestFigma(m.data, m.data.fileName), m.data.fileName || "This file");
+      if (m.afterApply) { showTab("overview"); status($("status").textContent + " · changes applied"); }
+    } else if (m.type === "report") {
+      S.dry = m.report;
+      if (!m.report.dryRun) {
+        renderDry();
+        S.appliedLog = (S.appliedLog || []).concat(S.gen ? S.gen.log : []);
+        S.gen = null; S.projected = null; S.choices = {};
+        status("Applied " + m.report.summary.totalChanges + " changes. Re-scanning…");
+        S.source = "figma";
+        post({ type: "scan", afterApply: true });
+      } else { status("Preview ready: " + m.report.summary.totalChanges + " changes"); renderDry(); }
+    } else if (m.type === "error") status("Error: " + m.message);
+  };
+
+  // ---------- export / import
+  function download(name, text, type) {
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: type || "text/plain" }));
+    a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  }
+  document.querySelectorAll("[data-dl]").forEach(function (b) {
+    b.onclick = function () {
+      if (!S.audit) return;
+      var k = b.dataset.dl;
+      try {
+        if (k === "report") { var g = ensureGen(); var applied = S.baseline.audit !== S.audit;
+          download("token-audit-report.md", TK.renderReport(S.baseline.audit, applied ? S.audit : TK.audit(g.model), applied ? S.appliedLog : g.log), "text/markdown"); }
+        else if (k === "audit-md") download("audit.md", TK.renderAuditMd(S.audit), "text/markdown");
+        else if (k === "css") download(ensureGen().manifest.css || "tokens.css", ensureGen().css, "text/css");
+        else if (k === "manifest") download("tokens.manifest.json", JSON.stringify(ensureGen().manifest, null, 2), "application/json");
+        else if (k === "export") download("figma-variables.json", JSON.stringify(S.exportData || {}, null, 2), "application/json");
+        else if (k === "audit-json") download("audit.json", JSON.stringify(S.audit, null, 2), "application/json");
+      } catch (e) { status("Export failed: " + e.message); }
+    };
+  });
+  $("importFile").onchange = function (e) {
+    var f = e.target.files[0];
+    if (!f) return;
+    f.text().then(function (txt) {
+      try {
+        var t = txt.trim(), model;
+        if (t.charAt(0) === "{") {
+          var d = JSON.parse(t);
+          model = /^token-foundry\/manifest@/.test(d.format || "") ? TK.ingestManifest(d, f.name) : TK.ingestFigma(d, f.name);
+        } else model = TK.ingestCss(txt, null, f.name);
+        S.source = "file"; S.baseline = null; S.appliedLog = null;
+        loadModel(model, f.name);
+        showTab("overview");
+      } catch (err) { status("Could not read " + f.name + ": " + err.message); }
+    });
+  };
+  $("backToFile").onclick = function () { S.baseline = null; S.appliedLog = null; $("scan").click(); };
+
+  post({ type: "scan" });
+})();
+</script>

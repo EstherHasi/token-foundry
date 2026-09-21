@@ -1,0 +1,21 @@
+/* some app tokens */
+:root {
+  --blue-100: #dbeafe; --blue-500: #3b82f6; --blue-700: #1d4ed8;
+  --gray-50: #f9fafb; --gray-200: #e5e7eb; --gray-500: #6b7280; --gray-900: #111827;
+  --brandColor: #3b82f6;
+  --bg-page: var(--gray-50);
+  --text-default: var(--gray-900);
+  --text-subtle: #9ca3af;
+  --button-primary-bg: var(--blue-500);
+  --button-primary-text: #ffffff;
+  --focus-ring: rgba(59,130,246,.5);
+  --space-sm: 0.5rem;
+  --font-body: "Inter", sans-serif;
+  --shadow-md: 0 1px 3px rgba(0,0,0,.2);
+}
+[data-theme="dark"] {
+  --bg-page: var(--gray-900);
+  --text-default: var(--gray-50);
+  --text-subtle: var(--gray-500);
+}
+@media (max-width: 600px) { :root { --space-sm: 4px; } }

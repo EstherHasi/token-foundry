@@ -46,7 +46,7 @@ Figma ┘   (IDs kept)                      └─> tokens.manifest.json  (Figma
 
 ## Install
 
-- **Figma plugin**: download `token-foundry-figma-plugin-<version>.zip` from [Releases](https://github.com/EstherHasi/token-foundry/releases), unzip, then in Figma desktop: Plugins → Development → Import plugin from manifest → `manifest.json`.
+- **Figma plugin**: download `token-foundry-figma-plugin-<version>.zip` from [Releases](https://github.com/EstherHasi/token-foundry/releases), unzip, then in Figma desktop - right mouse click: Plugins → Development → Import plugin from manifest → select the `manifest.json` file.
 - **Cowork**: download `token-foundry-<version>.plugin` from [Releases](https://github.com/EstherHasi/token-foundry/releases), open it and accept.
 - **Claude Code**:
 
